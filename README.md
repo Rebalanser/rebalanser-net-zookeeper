@@ -30,6 +30,12 @@ Once a follower, a client sets a watch on the next lowest client znode. When a n
 
 Followers place a watch on /chroot/group/status which will allow them to receive rebalancing commands from the coordinator via zookeeper.
 
+![](https://github.com/Rebalanser/rebalanser-net-zookeeper/blob/master/images/znodes-and-watches.png)
+
+![](https://github.com/Rebalanser/rebalanser-net-zookeeper/blob/master/images/coordinator-followers.png)
+
+In addition to the coordinator detecting that another client was elected coordinator via an epoch notification, all writes to the status and resources znodes are performed with a known version. If another client has also written those znodes as coordinator then the version number will have been incremented and the write will fail. This ensures that zombie coordinators are unable to negatively impact rebalancing.
+
 ### Rebalancing
 When a client comes or goes, or a resource is added/removed as a child znode to the /chroot/group/resources path, a rebalancing takes place.
 
@@ -48,6 +54,8 @@ The steps in a rebalancing are as follows:
 12. Followers: Delete() ephemeral child node of /chroot/group/stopped
 13. Coordinator: Notifications received on /chroot/group/stopped.
 14. Coordinator: When no more child znodes exist, call SetData() "StartConfirmed" on /chroot/group/status
+
+![](https://github.com/Rebalanser/rebalanser-net-zookeeper/blob/master/images/rebalancing-zookeeper.png)
 
 The coordinator or a follower could fail at anytime during rebalancing. The loss of the coordinator will cause leader election to be triggered. New coordinators always start a new rebalancing. When a new rebalancing is triggered, it aborts any in progress rebalancing.
 
