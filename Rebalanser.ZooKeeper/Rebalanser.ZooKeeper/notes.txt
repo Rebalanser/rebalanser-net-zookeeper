@@ -1,0 +1,49 @@
+Nodes register ephemeral sequential znodes under /nodes
+
+/nodes/n_0000000001
+/nodes/n_0000000002
+/nodes/n_0000000003
+/nodes/n_0000000004
+/nodes/n_0000000005
+
+Each node checks to see if it is the lowest. If there are no nodes before it then it is the leader.
+
+Once leader, a node adds the following watches:
+ - a children watch on /nodes.
+ - a children watch on /resources
+ - a get data watch on /term (to detect leader change)
+
+Once a Follower, a node adds the following watches:
+  - a watch on the child before it (so n_0000000003 watches n_0000000002)
+  - a watch on the /status znode 
+
+Once leader, or when a leader's children watches fire, the leader carries out a rebalancing.
+
+1. Rebalancing
+
+The leader sets the data of the /status znode to "stop activity".
+Each follower receives the notification and:
+ - invokes the "stop" event handler
+ - once the stop event handler is complete it adds an ephemeral znode to /stopped with its client Id
+ 
+The leader polls the children of /stopped until the children match the /nodes children
+
+The leader gets the list of children under /nodes and the list of resources under /resources 
+and assigns nodes to resources in an equally distributed manner. It then updates
+the data of /resources with a list of resource-node pairs. Then it sets the data of
+/status to "start activity".
+
+The watching followers receive the /status notification and:
+ - read the resource-node pairs from the /resources znode
+ - invoke the resources assigned event handler passing the resources it has been assigned
+ - remove their ephemeral nodes from /stopped
+ - add a watch on status (checking the value has not changed already)
+ 
+The leader sees that all ephemeral znodes have been removed from /stopped and rebalancing is complete.
+
+2. Interrupted rebalancing
+
+For the sake of simplicity, rebalancing is only interrupted if a node is removed (that would invalidate rebalancing). 
+If a new node is added mid-rebalancing then a new rebalancing is triggered once the current one is complete. 
+To avoid interruptions, by nodes coming and going, rebalancing is delayed by a number of seconds, allowing watch notifications to accumulate.
+This will reduce the number of rebalancing events triggered during a cluster start up or shutdown.
