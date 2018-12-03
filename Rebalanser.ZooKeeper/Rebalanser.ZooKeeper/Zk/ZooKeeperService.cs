@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading.Tasks;
 using Newtonsoft.Json;
 using org.apache.zookeeper;
@@ -25,7 +26,7 @@ namespace Rebalanser.ZooKeeper.Zk
             this.logger = logger;
         }
         
-        public void Initialize(string clientsPath,
+        public async Task<bool> InitializeAsync(string clientsPath,
             string statusPath,
             string stoppedPath,
             string resourcesPath,
@@ -36,9 +37,46 @@ namespace Rebalanser.ZooKeeper.Zk
             this.stoppedPath = stoppedPath;
             this.resourcesPath = resourcesPath;
             this.epochPath = epochPath;
+
+            var clientsPathRes = await EnsurePathAsync(this.clientsPath);
+            if (clientsPathRes != ZkResult.Ok)
+            {
+                this.logger.Error($"znode {this.clientsPath} does not exist and could not be created");
+                return false;
+            }
+            
+            var epochPathRes = await EnsurePathAsync(this.epochPath);
+            if (epochPathRes != ZkResult.Ok)
+            {
+                this.logger.Error($"znode {this.epochPath} does not exist and could not be created");
+                return false;
+            }
+            
+            var statusPathRes = await EnsurePathAsync(this.statusPath);
+            if (statusPathRes != ZkResult.Ok)
+            {
+                this.logger.Error($"znode {this.statusPath} does not exist and could not be created");
+                return false;
+            }
+            
+            var stoppedPathRes = await EnsurePathAsync(this.stoppedPath);
+            if (stoppedPathRes != ZkResult.Ok)
+            {
+                this.logger.Error($"znode {this.stoppedPath} does not exist and could not be created");
+                return false;
+            }
+            
+            var resourcesPathRes = await EnsurePathAsync(this.resourcesPath);
+            if (resourcesPathRes != ZkResult.Ok)
+            {
+                this.logger.Error($"znode {this.resourcesPath} does not exist and could not be created");
+                return false;
+            }
+
+            return true;
         }
 
-        public Watcher.Event.KeeperState GetKeeperState()
+        public Event.KeeperState GetKeeperState()
         {
             return this.keeperState;
         }
@@ -58,7 +96,13 @@ namespace Rebalanser.ZooKeeper.Zk
             while (keeperState != Event.KeeperState.SyncConnected)
                 await Task.Delay(50);
         }
-        
+
+        public async Task CloseSessionAsync()
+        {
+            await this.zookeeper.closeAsync();
+            this.zookeeper = null;
+        }
+
         public override async Task process(WatchedEvent @event)
         {
             this.keeperState = @event.getState();
@@ -127,6 +171,43 @@ namespace Rebalanser.ZooKeeper.Zk
                 return ZkResult.UnexpectedError;
             }
         }
+
+        public async Task<ZkResult> EnsurePathAsync(string znodePath)
+        {
+            try
+            {
+                var znodeStat = await this.zookeeper.existsAsync(znodePath);
+                if (znodeStat == null)
+                {
+                    await this.zookeeper.createAsync(znodePath,
+                        System.Text.Encoding.UTF8.GetBytes("0"),
+                        ZooDefs.Ids.OPEN_ACL_UNSAFE,
+                        CreateMode.PERSISTENT);
+                }
+
+                return ZkResult.Ok;
+            }
+            catch (KeeperException.NodeExistsException)
+            {
+                return ZkResult.Ok;
+            }
+            catch (KeeperException.ConnectionLossException e)
+            {
+                this.logger.Error($"Could not create znode {znodePath} as the connection has been lost: " + e);
+                return ZkResult.ConnectionLost;
+            }
+            catch (KeeperException.SessionExpiredException e)
+            {
+                this.logger.Error($"Could not create znode {znodePath} as the session has expired: " + e);
+                return ZkResult.SessionExpired;
+            }
+            catch (Exception e)
+            {
+                this.logger.Error($"Could not create znode {znodePath}: " + e);
+                return ZkResult.UnexpectedError;
+            }
+            //
+        }
         
         public async Task<ZkResponse<int>> IncrementEpochAsync(int currentEpoch)
         {
@@ -174,11 +255,11 @@ namespace Rebalanser.ZooKeeper.Zk
             try
             {
                 var childrenResult = await this.zookeeper.getChildrenAsync(this.clientsPath);
-
+                var childrenPaths = childrenResult.Children.Select(x => $"{this.clientsPath}/{x}").ToList();
                 return new ZkResponse<ClientsZnode>(ZkResult.Ok, new ClientsZnode()
                 {
                     Version = childrenResult.Stat.getVersion(),
-                    ClientPaths = childrenResult.Children
+                    ClientPaths = childrenPaths
                 });
             }
             catch (KeeperException.NoNodeException e)
@@ -317,8 +398,9 @@ namespace Rebalanser.ZooKeeper.Zk
             }
             catch (KeeperException.NoNodeException e)
             {
-                this.logger.Error("Could not remove follower from the stopped list as the stopped node does not exist: " + e);
-                return ZkResult.NoZnode;
+                //this.logger.Error("Could not remove follower from the stopped list as the stopped node does not exist: " + e);
+                //return ZkResult.NoZnode;
+                return ZkResult.Ok;
             }
             catch (KeeperException.ConnectionLossException e)
             {
@@ -345,6 +427,9 @@ namespace Rebalanser.ZooKeeper.Zk
                 var childrenResult = await this.zookeeper.getChildrenAsync(this.resourcesPath);
                 var resourcesZnodeData = JsonConvert.DeserializeObject<ResourcesZnodeData>(
                         System.Text.Encoding.UTF8.GetString(dataResult.Data));
+                
+                if(resourcesZnodeData == null)
+                    resourcesZnodeData = new ResourcesZnodeData();
 
                 return new ZkResponse<ResourcesZnode>(ZkResult.Ok, new ResourcesZnode()
                 {

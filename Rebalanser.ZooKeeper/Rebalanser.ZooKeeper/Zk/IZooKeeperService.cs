@@ -9,13 +9,15 @@ namespace Rebalanser.ZooKeeper.Zk
     {
         Watcher.Event.KeeperState GetKeeperState();
         Task StartSessionAsync(TimeSpan sessionTimeout);
-        void Initialize(string clientsPath,
+        Task CloseSessionAsync();
+        Task<bool> InitializeAsync(string clientsPath,
             string statusPath,
             string stoppedPath,
             string resourcesPath,
             string epochPath);
         Task<ZkResult> DeleteClientAsync(string clientPath);
         Task<ZkResponse<string>> CreateClientAsync();
+        Task<ZkResult> EnsurePathAsync(string znodePath);
         Task<ZkResponse<int>> IncrementEpochAsync(int currentEpoch);
         Task<ZkResponse<int>> GetEpochAsync();
         Task<ZkResponse<ClientsZnode>> GetActiveClientsAsync();

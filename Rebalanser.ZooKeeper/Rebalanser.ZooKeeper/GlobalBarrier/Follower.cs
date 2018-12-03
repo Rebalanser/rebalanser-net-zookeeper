@@ -8,9 +8,9 @@ using Rebalanser.Core.Logging;
 using Rebalanser.ZooKeeper.Store;
 using Rebalanser.ZooKeeper.Zk;
 
-namespace Rebalanser.ZooKeeper
+namespace Rebalanser.ZooKeeper.GlobalBarrier
 {
-    public class Follower : Watcher
+    public class Follower : Watcher, IFollower
     {
         private IZooKeeperService zooKeeperService;
         private ILogger logger;
@@ -22,6 +22,15 @@ namespace Rebalanser.ZooKeeper
         private FollowerExitReason eventExitReason;
         private bool statusChange;
         private string watchSiblingPath;
+        private string siblingId;
+        private int statusVersion;
+
+        private enum SiblingCheckResult
+        {
+            WatchingNewSibling,
+            IsNewLeader,
+            Error
+        }
         
         public Follower(IZooKeeperService zooKeeperService,
             ILogger logger,
@@ -39,22 +48,24 @@ namespace Rebalanser.ZooKeeper
             this.clientId = clientId;
             this.clientNumber = clientNumber;
             this.watchSiblingPath = watchSiblingPath;
+            this.siblingId = watchSiblingPath.Substring(watchSiblingPath.LastIndexOf("/", StringComparison.Ordinal));
             this.followerToken = followerToken;
         }
 
-        public async Task<bool> InitializeAsync()
+        public async Task<bool> BecomeFollowerAsync()
         {
             var watchSiblingRes = await this.zooKeeperService.WatchSiblingNodeAsync(this.watchSiblingPath, this);
             if (watchSiblingRes != ZkResult.Ok)
+            {
+                if(watchSiblingRes == ZkResult.NoZnode)
+                    this.logger.Info($"Could not set a watch on sibling node {this.watchSiblingPath} as it no longer exists");
                 return false;
-            
+            }
+
             var watchStatusRes = await this.zooKeeperService.WatchStatusAsync(this);
             if (watchStatusRes.Result != ZkResult.Ok)
                 return false;
             
-            if (watchStatusRes.Data.CoordinatorStatus == CoordinatorStatus.ResourcesGranted)
-                statusChange = true;
-
             return true;
         }
         
@@ -66,11 +77,23 @@ namespace Rebalanser.ZooKeeper
             }
             // if the sibling client has been removed then this client must either be the new leader
             // or the node needs to monitor the next smallest client
-            else if (@event.getPath().EndsWith(this.watchSiblingPath))
+            else if (@event.getPath().EndsWith(this.siblingId))
             {
-                var ok = await CheckForSiblings();
-                if(!ok)
-                    eventExitReason = FollowerExitReason.UnexpectedFailure;
+                var siblingResult = await CheckForSiblings();
+                switch (siblingResult)
+                {
+                    case SiblingCheckResult.WatchingNewSibling:
+                        break;
+                    case SiblingCheckResult.IsNewLeader:
+                        eventExitReason = FollowerExitReason.IsNewLeader;
+                        break;
+                    case SiblingCheckResult.Error:
+                        eventExitReason = FollowerExitReason.UnexpectedFailure;
+                        break;
+                    default:
+                        this.logger.Error($"Non-supported SiblingCheckResult {siblingResult}");
+                        break;
+                }
             }
             // status change
             else if (@event.getPath().EndsWith("status"))
@@ -87,6 +110,9 @@ namespace Rebalanser.ZooKeeper
         
         public async Task<FollowerExitReason> StartEventLoopAsync()
         {
+            int lastStopVersion = 0;
+            int lastStartVersion = 0;
+            
             while (!this.followerToken.IsCancellationRequested)
             {
                 if (this.eventExitReason != FollowerExitReason.NoExit)
@@ -111,40 +137,60 @@ namespace Rebalanser.ZooKeeper
                     if (status.CoordinatorStatus == CoordinatorStatus.StopActivity)
                     {
                         InvokeOnStopActions();
-                        await this.zooKeeperService.SetFollowerAsStopped(this.clientId);
+                        var stoppedRes = await this.zooKeeperService.SetFollowerAsStopped(this.clientId);
+                        if (stoppedRes != ZkResult.Ok)
+                        {
+                            if (stoppedRes == ZkResult.NodeAlreadyExists && lastStopVersion > lastStartVersion)
+                                this.logger.Info("Two consecutive stop commands received.");
+                            else if (stoppedRes == ZkResult.SessionExpired)
+                                return FollowerExitReason.SessionExpired;
+
+                            return FollowerExitReason.UnexpectedFailure;
+                        }
+
+                        lastStopVersion = status.Version;
                     }
                     else if (status.CoordinatorStatus == CoordinatorStatus.ResourcesGranted)
                     {
-                        var resourcesRes = await this.zooKeeperService.GetResourcesAsync();
-                        if (resourcesRes.Result != ZkResult.Ok)
+                        if (lastStopVersion > 0)
                         {
-                            if (watchStatusRes.Result == ZkResult.SessionExpired)
-                                return FollowerExitReason.SessionExpired;
+                            var resourcesRes = await this.zooKeeperService.GetResourcesAsync();
+                            if (resourcesRes.Result != ZkResult.Ok)
+                            {
+                                if (watchStatusRes.Result == ZkResult.SessionExpired)
+                                    return FollowerExitReason.SessionExpired;
 
-                            return FollowerExitReason.UnexpectedFailure;
+                                return FollowerExitReason.UnexpectedFailure;
+                            }
+
+                            var resources = resourcesRes.Data;
+                            var assignedResources = resources.ResourceAssignments.Assignments
+                                .Where(x => x.ClientId.Equals(this.clientId))
+                                .Select(x => x.Resource)
+                                .ToList();
+
+                            this.store.SetResources(new SetResourcesRequest()
+                            {
+                                AssignmentStatus = AssignmentStatus.ResourcesAssigned,
+                                Resources = assignedResources
+                            });
+
+                            InvokeOnStartActions();
+                            var startedRes = await this.zooKeeperService.SetFollowerAsStarted(this.clientId);
+                            if (startedRes != ZkResult.Ok && startedRes != ZkResult.NoZnode)
+                            {
+                                if (watchStatusRes.Result == ZkResult.SessionExpired)
+                                    return FollowerExitReason.SessionExpired;
+
+                                return FollowerExitReason.UnexpectedFailure;
+                            }
+                        }
+                        else
+                        {
+                            this.logger.Info("Ignoring ResourcesGranted status as did not receive a StopActivity notification. Likely I am a new follower.");
                         }
 
-                        var resources = resourcesRes.Data;
-                        var assignedResources = resources.ResourceAssignments.Assignments
-                            .Where(x => x.ClientId.Equals(this.clientId))
-                            .Select(x => x.Resource)
-                            .ToList();
-                        
-                        this.store.SetResources(new SetResourcesRequest()
-                        {
-                            AssignmentStatus = AssignmentStatus.ResourcesAssigned,
-                            Resources = assignedResources
-                        });
-                        
-                        InvokeOnStartActions();
-                        var startedRes = await this.zooKeeperService.SetFollowerAsStarted(this.clientId);
-                        if (startedRes != ZkResult.Ok)
-                        {
-                            if (watchStatusRes.Result == ZkResult.SessionExpired)
-                                return FollowerExitReason.SessionExpired;
-
-                            return FollowerExitReason.UnexpectedFailure;
-                        }
+                        lastStartVersion = status.Version;
                     }
                     else if (status.CoordinatorStatus == CoordinatorStatus.StartConfirmed)
                     {
@@ -157,6 +203,12 @@ namespace Rebalanser.ZooKeeper
                 }
 
                 await WaitFor(1000);
+            }
+
+            if (this.followerToken.IsCancellationRequested)
+            {
+                await this.zooKeeperService.CloseSessionAsync();
+                return FollowerExitReason.Cancelled;
             }
 
             return FollowerExitReason.UnexpectedFailure;
@@ -184,13 +236,13 @@ namespace Rebalanser.ZooKeeper
             {}
         }
 
-        private async Task<bool> CheckForSiblings()
+        private async Task<SiblingCheckResult> CheckForSiblings()
         {
             int maxClientNumber = 0;
             string watchChild = string.Empty;
             var clientsRes = await this.zooKeeperService.GetActiveClientsAsync();
             if (clientsRes.Result != ZkResult.Ok)
-                return false;
+                return SiblingCheckResult.Error;
                 
             var clients = clientsRes.Data;
             foreach (var childPath in clients.ClientPaths)
@@ -204,19 +256,15 @@ namespace Rebalanser.ZooKeeper
             }
 
             if (maxClientNumber == 0)
-            {
-                eventExitReason = FollowerExitReason.IsNewLeader;
-                return false;
-            }
-            else
-            {
-                this.watchSiblingPath = watchChild;
-                var newWatchRes = await this.zooKeeperService.WatchSiblingNodeAsync(watchChild, this);
-                if (newWatchRes != ZkResult.Ok)
-                    return false;
-                
-                return true;
-            }
+                return SiblingCheckResult.IsNewLeader;
+            
+            this.watchSiblingPath = watchChild;
+            this.siblingId = watchSiblingPath.Substring(watchChild.LastIndexOf("/", StringComparison.Ordinal));
+            var newWatchRes = await this.zooKeeperService.WatchSiblingNodeAsync(watchChild, this);
+            if (newWatchRes != ZkResult.Ok)
+                return SiblingCheckResult.Error;
+            
+            return SiblingCheckResult.WatchingNewSibling;
         }
     }
 }

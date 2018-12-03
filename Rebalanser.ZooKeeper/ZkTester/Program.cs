@@ -12,6 +12,11 @@ namespace ZkTester
     {
         static void Main(string[] args)
         {
+#if DEBUG
+            Console.WriteLine("Press enter to start");
+            Console.ReadLine();
+#endif
+            
             var p = new Program();
             p.MainAsync().Wait();
         }
@@ -26,9 +31,10 @@ namespace ZkTester
             while (true)
             {
                 Console.WriteLine($"{clientTasks.Count} nodes");
-                Console.WriteLine("Type \"add\" to add, or a number to remove");
-                var input = Console.ReadLine();
-                if (input == "add")
+                Console.WriteLine("Type \"+\" to add, or a number to remove a client (at that index)");
+                var input = Console.ReadKey();
+                
+                if (input.Key == ConsoleKey.Add)
                 {
                     id++;
                     var cts = new CancellationTokenSource();
@@ -42,7 +48,7 @@ namespace ZkTester
                 }
                 else
                 {
-                    int index = int.Parse(input);
+                    int index = int.Parse(input.KeyChar.ToString());
                     if (index > clientTasks.Count)
                     {
                         Console.WriteLine("Index too big");
@@ -66,7 +72,8 @@ namespace ZkTester
             Console.WriteLine($"{id}: Starting");
             var zkProvider = new ZooKeeperProvider("localhost:2181", 
                 "/rebalanser", 
-                TimeSpan.FromMinutes(5), 
+                TimeSpan.FromMinutes(5),
+                RebalancingMode.GlobalBarrier,
                 new ConsoleLogger());
             Providers.Register(zkProvider);
             

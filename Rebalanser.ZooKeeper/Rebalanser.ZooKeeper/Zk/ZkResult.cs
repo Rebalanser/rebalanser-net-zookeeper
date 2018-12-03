@@ -8,6 +8,7 @@ namespace Rebalanser.ZooKeeper.Zk
         BadVersion,
         NoZnode,
         ConnectionLost,
-        UnexpectedError
+        UnexpectedError,
+        NodeAlreadyExists
     }
 }

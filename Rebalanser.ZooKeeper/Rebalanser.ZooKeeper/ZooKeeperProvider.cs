@@ -7,17 +7,19 @@ using Rebalanser.Core;
 using Rebalanser.Core.Logging;
 using Rebalanser.ZooKeeper.Store;
 using Rebalanser.ZooKeeper.Zk;
+using GB = Rebalanser.ZooKeeper.GlobalBarrier;
 
 namespace Rebalanser.ZooKeeper
 {
     public class ZooKeeperProvider : IRebalanserProvider
     {
-        private string zooKeeperHosts;
         private string zooKeeperRootPath;
         private string resourceGroup;
         private ILogger logger;
         private IZooKeeperService zooKeeperService;
         private ResourceGroupStore store;
+        private RebalancingMode rebalancingMode;
+        private TimeSpan sessionTimeout;
         private int clientNumber;
         private string clientId;
         private string clientPath;
@@ -29,20 +31,20 @@ namespace Rebalanser.ZooKeeper
         public ZooKeeperProvider(string zookeeperHosts,
             string zookeeperRootPath,
             TimeSpan sessionTimeout,
+            RebalancingMode rebalancingMode,
             ILogger logger,
             IZooKeeperService zooKeeperService=null)
         {
-            this.zooKeeperHosts = zookeeperHosts;
             this.zooKeeperRootPath = zookeeperRootPath;
+            this.rebalancingMode = rebalancingMode;
+            this.sessionTimeout = sessionTimeout;
             this.logger = logger;
             this.store = new ResourceGroupStore();
             this.clientPath = "";
             this.clientId = "";
 
             if (zooKeeperService == null)
-            {
-                this.zooKeeperService = new ZooKeeperService(zooKeeperHosts, logger);
-            }
+                this.zooKeeperService = new ZooKeeperService(zookeeperHosts, logger);
             else
                 this.zooKeeperService = zooKeeperService;
         }
@@ -54,18 +56,12 @@ namespace Rebalanser.ZooKeeper
             {
                 if (this.started)
                     throw new RebalanserException("Context already started");
-                
+
                 this.started = true;
             }
-            
-            this.resourceGroup = resourceGroup;
-            this.logger.Info("Initializing zookeeper client paths");
-            this.zooKeeperService.Initialize($"{this.zooKeeperRootPath}/{this.resourceGroup}/clients",
-                $"{this.zooKeeperRootPath}/{this.resourceGroup}/status",
-                $"{this.zooKeeperRootPath}/{this.resourceGroup}/stopped",
-                $"{this.zooKeeperRootPath}/{this.resourceGroup}/resources",
-                $"{this.zooKeeperRootPath}/{this.resourceGroup}/epoch");
 
+            this.resourceGroup = resourceGroup;
+            
             mainTask = Task.Run(async () =>
             {
                 while (!token.IsCancellationRequested)
@@ -83,20 +79,42 @@ namespace Rebalanser.ZooKeeper
                     }
 
                     if (sessionTerm == SessionTermination.NonRecoverableError)
+                    {
+                        NotifyOfError(onChangeActions, "An unrecoverable error has occurred,that auto-recovery cannot handle. Check the log for details", contextOptions.AutoRecoveryOnError, null);
                         break;
+                    }
                 }
+                
+                this.logger.Info("Rebalanser context terminated");
+                this.started = false;
             });
 
             await Task.Yield();
-            this.logger.Info("Rebalanser context terminated");
         }
 
-        private async Task<SessionTermination> StartSessionAsync(OnChangeActions onChangeActions, CancellationToken token, ContextOptions contextOptions)
+        private async Task<SessionTermination> StartSessionAsync(OnChangeActions onChangeActions, 
+            CancellationToken token, 
+            ContextOptions contextOptions)
         {
             this.logger.Info("Opening new session");
             // blocks until the session starts
-            await this.zooKeeperService.StartSessionAsync(TimeSpan.FromSeconds(20));
-            this.logger.Info($"Session opened");
+            await this.zooKeeperService.StartSessionAsync(this.sessionTimeout);
+            
+            this.logger.Info("Initializing zookeeper client paths");
+            var initialized = await this.zooKeeperService.InitializeAsync(
+                $"{this.zooKeeperRootPath}/{this.resourceGroup}/clients",
+                $"{this.zooKeeperRootPath}/{this.resourceGroup}/status",
+                $"{this.zooKeeperRootPath}/{this.resourceGroup}/stopped",
+                $"{this.zooKeeperRootPath}/{this.resourceGroup}/resources",
+                $"{this.zooKeeperRootPath}/{this.resourceGroup}/epoch");
+
+            if (!initialized)
+            {
+                var msg =
+                    "Could not start a new rebalanser context due to failure to initialize the ZooKeeper client.";
+                this.logger.Error(msg);
+                return SessionTermination.NonRecoverableError;
+            }
             
             var createRes = await this.zooKeeperService.CreateClientAsync();
             if (createRes.Result == ZkResult.SessionExpired)
@@ -123,21 +141,25 @@ namespace Rebalanser.ZooKeeper
                 if (siblingPath == string.Empty)
                 {
                     this.logger.Info($"I am the smallest sibling and therefore the leader");
-                    var coordinator = new Coordinator(this.zooKeeperService,
-                        this.logger,
-                        this.store,
-                        onChangeActions,
-                        this.clientId,
-                        token);
-
-                    var hasBecome = await coordinator.BecomeCoordinatorAsync();
-                    if (!hasBecome)
+                    ICoordinator coordinator;
+                    switch (this.rebalancingMode)
                     {
-                        this.logger.Error("Could not become coordinator");
-                        if (this.zooKeeperService.GetKeeperState() == Watcher.Event.KeeperState.Expired)
-                            return SessionTermination.Expired;
+                        case RebalancingMode.GlobalBarrier:
+                            coordinator = new GB.Coordinator(this.zooKeeperService,
+                                this.logger,
+                                this.store,
+                                onChangeActions,
+                                this.clientId,
+                                token);
+                            break;
+                        case RebalancingMode.ResourceBarrier:
+                            throw new Exception(); // TODO
+                        default:
+                            throw new Exception(); // TODO
                     }
-                    else
+                    
+                    var hasBecome = await coordinator.BecomeCoordinatorAsync();
+                    if (hasBecome)
                     {
                         this.logger.Info($"Have become the coordinator");
                         // this blocks until coordinator terminates (due to failure, session expiry or detects it is a zombie)
@@ -148,35 +170,56 @@ namespace Rebalanser.ZooKeeper
                         if (coordinatorExitReason == CoordinatorExitReason.SessionExpired)
                             return SessionTermination.Expired;
                     }
+                    else
+                    {
+                        this.logger.Error("Could not become coordinator");
+                        if (this.zooKeeperService.GetKeeperState() == Watcher.Event.KeeperState.Expired)
+                            return SessionTermination.Expired;
+                    }
                 }
                 else
                 {
                     this.logger.Info($"I am not the smallest sibling, becoming a follower");
-                    var follower = new Follower(this.zooKeeperService,
-                        this.logger,
-                        this.store,
-                        onChangeActions,
-                        this.clientId,
-                        this.clientNumber,
-                        siblingPath,
-                        token);
 
-                    var followerInitialized = await follower.InitializeAsync();
+                    IFollower follower;
+                    switch (this.rebalancingMode)
+                    {
+                        case RebalancingMode.GlobalBarrier:
+                            follower = new GB.Follower(this.zooKeeperService,
+                                this.logger,
+                                this.store,
+                                onChangeActions,
+                                this.clientId,
+                                this.clientNumber,
+                                siblingPath,
+                                token);
+                            break;
+                        case RebalancingMode.ResourceBarrier:
+                            throw new Exception(); // TODO
+                        default:
+                            throw new Exception(); // TODO
+                    }
+
+                    var followerInitialized = await follower.BecomeFollowerAsync();
                     if (followerInitialized)
                     {
-                        this.logger.Info($"Starting follower event loop");
+                        this.logger.Info($"Have become a follower, starting follower event loop");
                         // blocks until follower either fails, the session expires or the follower detects it might be the new leader
                         var followerExitReason = await follower.StartEventLoopAsync();
                         this.logger.Info($"The follower has exited for reason {followerExitReason}");
-                        if (followerExitReason == FollowerExitReason.Cancelled)
-                            return SessionTermination.Cancelled;
-                        if (followerExitReason == FollowerExitReason.SessionExpired)
+                        switch (followerExitReason)
+                        {
+                            case FollowerExitReason.IsNewLeader: continue;
+                            case FollowerExitReason.SessionExpired: return SessionTermination.Expired; 
+                            case FollowerExitReason.Cancelled: return SessionTermination.Cancelled;
+                        }
+                    }
+                    else
+                    {
+                        this.logger.Error("Could not become a follower");
+                        if(this.zooKeeperService.GetKeeperState() == Watcher.Event.KeeperState.Expired)
                             return SessionTermination.Expired;
                     }
-                    else if(this.zooKeeperService.GetKeeperState() == Watcher.Event.KeeperState.Expired)
-                        return SessionTermination.Expired;
-                    
-                    this.logger.Info($"Count not become follower");
                 }
 
                 // if we got here then neither cancellation nor some kind of session related error has occurred
@@ -196,10 +239,11 @@ namespace Rebalanser.ZooKeeper
 
             if(this.zooKeeperService.GetKeeperState() == Watcher.Event.KeeperState.Expired)
                 return SessionTermination.Expired;
-            else if (token.IsCancellationRequested)
+            
+            if (token.IsCancellationRequested)
                 return SessionTermination.Cancelled;
-            else
-                return SessionTermination.NonRecoverableError;
+            
+            return SessionTermination.NonRecoverableError;
         }
 
         private async Task<bool> BlockTillConnected(CancellationToken token)
@@ -219,7 +263,7 @@ namespace Rebalanser.ZooKeeper
         {
             try
             {
-                await Task.Delay(waitPeriod);
+                await Task.Delay(waitPeriod, token);
             }
             catch (TaskCanceledException)
             {}
@@ -237,8 +281,8 @@ namespace Rebalanser.ZooKeeper
                 var response = this.store.GetResources();
                 if (response.AssignmentStatus == AssignmentStatus.ResourcesAssigned || response.AssignmentStatus == AssignmentStatus.NoResourcesAssigned)
                     return response.Resources;
-                else
-                    Thread.Sleep(100);
+                
+                Thread.Sleep(100);
             }
         }
 
@@ -259,20 +303,20 @@ namespace Rebalanser.ZooKeeper
         private void SetIdFromPath()
         {
             this.clientNumber = int.Parse(this.clientPath.Substring(this.clientPath.Length - 10, 10));
-            this.clientId = this.clientPath.Substring(this.clientPath.Length - 10, 10);
+            this.clientId = this.clientPath.Substring(this.clientPath.LastIndexOf("/", StringComparison.Ordinal)+1);
         }
 
         private async Task<string> GetSiblingToWatchAsync()
         {
-            int maxClientNumber = 0;
-            string watchChild = string.Empty;
+            var maxClientNumber = 0;
+            var watchChild = string.Empty;
             var clientsRes = await this.zooKeeperService.GetActiveClientsAsync();
             if (clientsRes.Result == ZkResult.Ok)
             {
                 var clients = clientsRes.Data;
                 foreach (var childPath in clients.ClientPaths)
                 {
-                    int siblingClientNumber = int.Parse(childPath.Substring(childPath.Length - 10, 10));
+                    var siblingClientNumber = int.Parse(childPath.Substring(childPath.Length - 10, 10));
                     if (siblingClientNumber > maxClientNumber && siblingClientNumber < this.clientNumber)
                     {
                         watchChild = childPath;

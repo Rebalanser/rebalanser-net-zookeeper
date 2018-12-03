@@ -10,9 +10,9 @@ using Rebalanser.Core.Logging;
 using Rebalanser.ZooKeeper.Store;
 using Rebalanser.ZooKeeper.Zk;
 
-namespace Rebalanser.ZooKeeper
+namespace Rebalanser.ZooKeeper.GlobalBarrier
 {
-    public class Coordinator : Watcher
+    public class Coordinator : Watcher, ICoordinator
     {
 
         private IZooKeeperService zooKeeperService;
@@ -68,12 +68,16 @@ namespace Rebalanser.ZooKeeper
                 return false;
 
             this.status = getStatusRes.Data;
+            this.pendingRebalancing = true;
             return true;
         }
 
         public override async Task process(WatchedEvent @event)
         {
             this.keeperState = @event.getState();
+
+            if (this.coordinatorToken.IsCancellationRequested)
+                return;
             
             if (@event.getState() == Event.KeeperState.Expired)
             {
@@ -103,47 +107,48 @@ namespace Rebalanser.ZooKeeper
 
         public async Task<CoordinatorExitReason> StartEventLoopAsync()
         {
+            int logicalTimeSinceRebalancingTrigger = 0;
             while (!this.coordinatorToken.IsCancellationRequested)
             {
+                logicalTimeSinceRebalancingTrigger++;
+                
                 if (this.eventCoordinatorExitReason != CoordinatorExitReason.NoExit)
                 {
-                    await WaitForRebalancingToEnd();
+                    await CancelRebalancingIfInProgressAsync();
                     return this.eventCoordinatorExitReason;
                 }
                 
-                if (pendingRebalancing)
+                // if a rebalancing event has occurred, delay the start of rebalancing a little
+                // prevents multiple close together events causing multiple aborted rebalancings
+                if (logicalTimeSinceRebalancingTrigger > 5 && pendingRebalancing)
                 {
-                    logger.Info("Rebalancing required");
-                    if (rebalancingTask == null || rebalancingTask.IsCompleted)
-                    {
-                        logger.Info("Rebalancing triggered");
-                        pendingRebalancing = false;
-                        rebalancingTask = Task.Run(async () => await TriggerRebalancing(this.rebalancingCts.Token, 1));
-                    }
-                    else
-                    {
-                        logger.Info("Rebalancing already in progress, will wait for current rebalancing to complete");
-                        // do nothing, wait for current rebalancing to complete
-                    }
+                    await CancelRebalancingIfInProgressAsync();
+                    logger.Info("Rebalancing triggered");
+                    pendingRebalancing = false;
+                    logicalTimeSinceRebalancingTrigger = 0;
+                    rebalancingTask = Task.Run(async () => await TriggerRebalancing(this.rebalancingCts.Token, 1));
                 }
                 
                 await WaitFor(1000);
             }
-            
-            if(coordinatorToken.IsCancellationRequested)
+
+            if (this.coordinatorToken.IsCancellationRequested)
+            {
+                await this.zooKeeperService.CloseSessionAsync();
                 return CoordinatorExitReason.Cancelled;
+            }
 
             return CoordinatorExitReason.Unknown; // if this happens then we have a correctness bug
         }
 
-        private async Task WaitForRebalancingToEnd()
+        private async Task CancelRebalancingIfInProgressAsync()
         {
             if (this.rebalancingTask != null && !this.rebalancingTask.IsCompleted)
             {
                 logger.Info("Cancelling the rebalancing that is in progress");
                 this.rebalancingCts.Cancel();
                 await this.rebalancingTask; // might need to put a time limit on this
-                logger.Info("Rebalancing cancelled");
+                this.rebalancingCts = new CancellationTokenSource(); // reset cts
             }
         }
 
@@ -162,26 +167,38 @@ namespace Rebalanser.ZooKeeper
             try
             {
                 var result = await RebalanceAsync(rebalancingToken);
-                if (result == RebalancingResult.NotCoordinator)
+                switch (result)
                 {
-                    this.eventCoordinatorExitReason = CoordinatorExitReason.NotCoordinator;
-                }
-                else if(result == RebalancingResult.SessionExpired)
-                {
-                    this.eventCoordinatorExitReason = CoordinatorExitReason.SessionExpired;
-                }
-                else if (result == RebalancingResult.Failure || result == RebalancingResult.TimeLimitExceeded)
-                {
-                    attempt++;
-                    if (attempt > 3)
-                    {
+                    case RebalancingResult.Complete: 
+                        logger.Info("Rebalancing complete");
+                        break;
+                    case RebalancingResult.Cancelled:
+                        logger.Info("Rebalancing cancelled");
+                        break;
+                    case RebalancingResult.NotCoordinator:
+                        this.eventCoordinatorExitReason = CoordinatorExitReason.NotCoordinator;
+                        break;
+                    case RebalancingResult.SessionExpired:
+                        this.eventCoordinatorExitReason = CoordinatorExitReason.SessionExpired;
+                        break;
+                    case RebalancingResult.Failure:
+                    case RebalancingResult.TimeLimitExceeded:
+                        attempt++;
+                        if (attempt > 3)
+                        {
+                            this.eventCoordinatorExitReason = CoordinatorExitReason.RebalancingError;
+                        }
+                        else
+                        {
+                            this.logger.Error($"Rebalancing failed. Will retry again with attempt {attempt}");
+                            await TriggerRebalancing(rebalancingToken, attempt);
+                        }
+
+                        break;
+                    default: 
+                        this.logger.Error($"A non-supported RebalancingResult has been returned: {result}");
                         this.eventCoordinatorExitReason = CoordinatorExitReason.RebalancingError;
-                    }
-                    else
-                    {
-                        this.logger.Error($"Rebalancing failed. Will retry again with attempt {attempt}");
-                        await TriggerRebalancing(rebalancingToken, attempt);
-                    }
+                        break;
                 }
             }
             catch (Exception ex)
@@ -246,7 +263,7 @@ namespace Rebalanser.ZooKeeper
             
             // wait for confirmation that all followers have stopped or for time limit
             bool allActivityStopped = false;
-            while (!allActivityStopped || sw.Elapsed > this.rebalancingTimeLimit)
+            while (!allActivityStopped && sw.Elapsed < this.rebalancingTimeLimit && !rebalancingToken.IsCancellationRequested)
             {
                 var stoppedRes = await this.zooKeeperService.GetStoppedAsync();
                 if(stoppedRes.Result == ZkResult.Ok)
@@ -278,6 +295,7 @@ namespace Rebalanser.ZooKeeper
                     Resource = resourcesToAssign.Dequeue()
                 });
 
+                clientIndex++;
                 if (clientIndex >= clients.ClientPaths.Count)
                     clientIndex = 0;
             }
@@ -360,16 +378,15 @@ namespace Rebalanser.ZooKeeper
             status.Version = setStatusRes.Data;
             
             // =============== COMPLETE =======================
-            logger.Info("rebalancing complete");
             return RebalancingResult.Complete;
         }
 
-        private bool IsClientListMatch(List<string> paths1, List<string> paths2)
+        private bool IsClientListMatch(List<string> clientPaths, List<string> stoppedPaths)
         {
-            var clientIds1 = paths1.Select(x => GetClientId(x)).OrderBy(x => x);
-            var clientIds2 = paths2.Select(x => GetClientId(x)).OrderBy(x => x);
+            var clientIds = clientPaths.Select(x => GetClientId(x)).Where(x => !x.Equals(this.clientId)).OrderBy(x => x);
+            var stoppedClientIds = stoppedPaths.Select(x => GetClientId(x)).OrderBy(x => x);
 
-            return clientIds1.SequenceEqual(clientIds2);
+            return clientIds.SequenceEqual(stoppedClientIds);
         }
 
         private string GetClientId(string clientPath)
