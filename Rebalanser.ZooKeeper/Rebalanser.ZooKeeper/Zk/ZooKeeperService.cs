@@ -367,9 +367,14 @@ namespace Rebalanser.ZooKeeper.Zk
                     CreateMode.EPHEMERAL);
                 return ZkResult.Ok;
             }
+            catch (KeeperException.NodeExistsException)
+            {
+                return ZkResult.NodeAlreadyExists;
+            }
             catch (KeeperException.NoNodeException e)
             {
-                this.logger.Error("Could not add follower to the stopped list as the stopped node does not exist: " + e);
+                this.logger.Error("Could not add follower to the stopped list as the stopped node does not exist: " +
+                                  e);
                 return ZkResult.NoZnode;
             }
             catch (KeeperException.ConnectionLossException e)

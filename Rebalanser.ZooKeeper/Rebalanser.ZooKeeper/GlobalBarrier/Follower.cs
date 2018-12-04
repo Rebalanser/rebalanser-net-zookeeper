@@ -123,82 +123,15 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
                 
                 if (this.statusChange)
                 {
-                    this.statusChange = false;
-                    var watchStatusRes = await this.zooKeeperService.WatchStatusAsync(this);
-                    if (watchStatusRes.Result != ZkResult.Ok)
+                    var result = await ProcessStatusChangeAsync(lastStopVersion, lastStartVersion);
+                    if (result.ExitReason == FollowerExitReason.NoExit)
                     {
-                        if (watchStatusRes.Result == ZkResult.SessionExpired)
-                            return FollowerExitReason.SessionExpired;
-
-                        return FollowerExitReason.UnexpectedFailure;
-                    }
-
-                    var status = watchStatusRes.Data;
-                    if (status.CoordinatorStatus == CoordinatorStatus.StopActivity)
-                    {
-                        InvokeOnStopActions();
-                        var stoppedRes = await this.zooKeeperService.SetFollowerAsStopped(this.clientId);
-                        if (stoppedRes != ZkResult.Ok)
-                        {
-                            if (stoppedRes == ZkResult.NodeAlreadyExists && lastStopVersion > lastStartVersion)
-                                this.logger.Info("Two consecutive stop commands received.");
-                            else if (stoppedRes == ZkResult.SessionExpired)
-                                return FollowerExitReason.SessionExpired;
-
-                            return FollowerExitReason.UnexpectedFailure;
-                        }
-
-                        lastStopVersion = status.Version;
-                    }
-                    else if (status.CoordinatorStatus == CoordinatorStatus.ResourcesGranted)
-                    {
-                        if (lastStopVersion > 0)
-                        {
-                            var resourcesRes = await this.zooKeeperService.GetResourcesAsync();
-                            if (resourcesRes.Result != ZkResult.Ok)
-                            {
-                                if (watchStatusRes.Result == ZkResult.SessionExpired)
-                                    return FollowerExitReason.SessionExpired;
-
-                                return FollowerExitReason.UnexpectedFailure;
-                            }
-
-                            var resources = resourcesRes.Data;
-                            var assignedResources = resources.ResourceAssignments.Assignments
-                                .Where(x => x.ClientId.Equals(this.clientId))
-                                .Select(x => x.Resource)
-                                .ToList();
-
-                            this.store.SetResources(new SetResourcesRequest()
-                            {
-                                AssignmentStatus = AssignmentStatus.ResourcesAssigned,
-                                Resources = assignedResources
-                            });
-
-                            InvokeOnStartActions();
-                            var startedRes = await this.zooKeeperService.SetFollowerAsStarted(this.clientId);
-                            if (startedRes != ZkResult.Ok && startedRes != ZkResult.NoZnode)
-                            {
-                                if (watchStatusRes.Result == ZkResult.SessionExpired)
-                                    return FollowerExitReason.SessionExpired;
-
-                                return FollowerExitReason.UnexpectedFailure;
-                            }
-                        }
-                        else
-                        {
-                            this.logger.Info("Ignoring ResourcesGranted status as did not receive a StopActivity notification. Likely I am a new follower.");
-                        }
-
-                        lastStartVersion = status.Version;
-                    }
-                    else if (status.CoordinatorStatus == CoordinatorStatus.StartConfirmed)
-                    {
-                        // do nothing
+                        lastStartVersion = result.LastStartVersion;
+                        lastStopVersion = result.LastStopVersion;
                     }
                     else
                     {
-                        // log unexpected status
+                        return result.ExitReason;
                     }
                 }
 
@@ -212,6 +145,96 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
             }
 
             return FollowerExitReason.UnexpectedFailure;
+        }
+
+        private async Task<StateChangeResult> ProcessStatusChangeAsync(int lastStopVersion, int lastStartVersion)
+        {
+            this.statusChange = false;
+            var watchStatusRes = await this.zooKeeperService.WatchStatusAsync(this);
+            if (watchStatusRes.Result != ZkResult.Ok)
+            {
+                if (watchStatusRes.Result == ZkResult.SessionExpired)
+                    return new StateChangeResult(FollowerExitReason.SessionExpired);
+
+                return new StateChangeResult(FollowerExitReason.UnexpectedFailure);
+            }
+
+            var result = new StateChangeResult(FollowerExitReason.NoExit);
+            var status = watchStatusRes.Data;
+            
+            if (status.CoordinatorStatus == CoordinatorStatus.StopActivity)
+            {
+                result.LastStopVersion = status.Version;
+                result.LastStartVersion = lastStartVersion;
+                
+                InvokeOnStopActions();
+                var stoppedRes = await this.zooKeeperService.SetFollowerAsStopped(this.clientId);
+                if (stoppedRes != ZkResult.Ok)
+                {
+                    if (stoppedRes == ZkResult.NodeAlreadyExists && lastStopVersion > lastStartVersion)
+                        this.logger.Info($"Two consecutive stop commands received. Last Stop Status Version: {lastStopVersion}, Last ResourceGranted Status Version: {lastStartVersion}");
+                    else if (stoppedRes == ZkResult.SessionExpired)
+                        result.ExitReason = FollowerExitReason.SessionExpired;
+                    else
+                        result.ExitReason = FollowerExitReason.UnexpectedFailure;
+                }
+            }
+            else if (status.CoordinatorStatus == CoordinatorStatus.ResourcesGranted)
+            {
+                if (lastStopVersion > 0)
+                {
+                    var resourcesRes = await this.zooKeeperService.GetResourcesAsync();
+                    if (resourcesRes.Result != ZkResult.Ok)
+                    {
+                        if (watchStatusRes.Result == ZkResult.SessionExpired)
+                            result.ExitReason = FollowerExitReason.SessionExpired;
+                        else
+                            result.ExitReason = FollowerExitReason.UnexpectedFailure;
+                    }
+                    else
+                    {
+                        var resources = resourcesRes.Data;
+                        var assignedResources = resources.ResourceAssignments.Assignments
+                            .Where(x => x.ClientId.Equals(this.clientId))
+                            .Select(x => x.Resource)
+                            .ToList();
+
+                        this.store.SetResources(new SetResourcesRequest()
+                        {
+                            AssignmentStatus = AssignmentStatus.ResourcesAssigned,
+                            Resources = assignedResources
+                        });
+
+                        InvokeOnStartActions();
+                        
+                        var startedRes = await this.zooKeeperService.SetFollowerAsStarted(this.clientId);
+                        if (startedRes != ZkResult.Ok && startedRes != ZkResult.NoZnode)
+                        {
+                            if (watchStatusRes.Result == ZkResult.SessionExpired)
+                                result.ExitReason = FollowerExitReason.SessionExpired;
+                            else
+                                result.ExitReason = FollowerExitReason.UnexpectedFailure;
+                        }
+                    }
+                }
+                else
+                {
+                    this.logger.Info("Ignoring ResourcesGranted status as did not receive a StopActivity notification. Likely I am a new follower.");
+                }
+
+                result.LastStartVersion = status.Version;
+                result.LastStopVersion = lastStopVersion;    
+            }
+            else if (status.CoordinatorStatus == CoordinatorStatus.StartConfirmed)
+            {
+                // do nothing
+            }
+            else
+            {
+                // log unexpected status
+            }
+            
+            return result;
         }
 
         private void InvokeOnStopActions()
@@ -230,7 +253,7 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
         {
             try
             {
-                await Task.Delay(5000, this.followerToken);
+                await Task.Delay(milliseconds, this.followerToken);
             }
             catch (TaskCanceledException)
             {}

@@ -18,7 +18,6 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
         private IZooKeeperService zooKeeperService;
         private ILogger logger;
         private ResourceGroupStore store;
-        private Event.KeeperState keeperState;
         private StatusZnode status;
         private TimeSpan rebalancingTimeLimit;
         private OnChangeActions onChangeActions;
@@ -28,7 +27,6 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
         private bool pendingRebalancing;
         private CoordinatorExitReason eventCoordinatorExitReason;
         private string clientId;
-        private int epoch;
 
         public Coordinator(IZooKeeperService zooKeeperService,
             ILogger logger,
@@ -52,8 +50,6 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
             var watchEpochRes = await this.zooKeeperService.WatchEpochAsync(this);
             if (watchEpochRes.Result != ZkResult.Ok)
                 return false;
-
-            this.epoch = watchEpochRes.Data;
             
             var watchNodesRes = await this.zooKeeperService.WatchNodesAsync(this);
             if (watchNodesRes != ZkResult.Ok)
@@ -74,8 +70,6 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
 
         public override async Task process(WatchedEvent @event)
         {
-            this.keeperState = @event.getState();
-
             if (this.coordinatorToken.IsCancellationRequested)
                 return;
             
@@ -176,9 +170,11 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
                         logger.Info("Rebalancing cancelled");
                         break;
                     case RebalancingResult.NotCoordinator:
+                        logger.Info("Rebalancing aborted, lost coordinator role");
                         this.eventCoordinatorExitReason = CoordinatorExitReason.NotCoordinator;
                         break;
                     case RebalancingResult.SessionExpired:
+                        logger.Info("Rebalancing aborted, lost session");
                         this.eventCoordinatorExitReason = CoordinatorExitReason.SessionExpired;
                         break;
                     case RebalancingResult.Failure:
@@ -207,33 +203,48 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
                 this.eventCoordinatorExitReason = CoordinatorExitReason.RebalancingError;
             }
         }
-        
-        /// <summary>
-        /// This method is too long and needs to be refactored
-        /// </summary>
-        /// <param name="rebalancingToken"></param>
-        /// <returns></returns>
+
         private async Task<RebalancingResult> RebalanceAsync(CancellationToken rebalancingToken)
         {
-            Stopwatch sw = new Stopwatch();
+            var sw = new Stopwatch();
             sw.Start();
 
-            //======== PHASE 1 - STOP ACTIVITY  ================
-            logger.Info("PHASE 1 - STOP ACTIVITY");
+            var stopPhaseResult = await StopActivityPhaseAsync(rebalancingToken, sw);
+            if (stopPhaseResult.PhaseResult != RebalancingResult.Complete)
+                return stopPhaseResult.PhaseResult;
+            
+            var assignPhaseResult = await AssignResourcesPhaseAsync(rebalancingToken, 
+                stopPhaseResult.ResourcesZnode,
+                stopPhaseResult.ClientsZnode);
+            
+            if (assignPhaseResult.PhaseResult != RebalancingResult.Complete)
+                return assignPhaseResult.PhaseResult;
+
+            var verifyPhaseResult = await VerifyStartedPhaseAsync(rebalancingToken, sw);
+            if (verifyPhaseResult.PhaseResult != RebalancingResult.Complete)
+                return assignPhaseResult.PhaseResult;
+            
+            return RebalancingResult.Complete;
+        }
+
+        private async Task<RebalancingPhaseResult> StopActivityPhaseAsync(CancellationToken rebalancingToken, Stopwatch sw)
+        {
+            logger.Info("PHASE 1 - Command followers to stop");
             status.CoordinatorStatus = CoordinatorStatus.StopActivity;
             var setStatusRes = await this.zooKeeperService.SetStatus(status);
             if (setStatusRes.Result != ZkResult.Ok)
             {
                 if (setStatusRes.Result == ZkResult.BadVersion)
-                    return RebalancingResult.NotCoordinator;
+                    return new RebalancingPhaseResult(RebalancingResult.NotCoordinator);
                 
                 if (setStatusRes.Result == ZkResult.SessionExpired)
-                    return RebalancingResult.SessionExpired;
+                    return new RebalancingPhaseResult(RebalancingResult.SessionExpired);
 
-                return RebalancingResult.Failure;
+                return new RebalancingPhaseResult(RebalancingResult.Failure);
             }
 
-            if (rebalancingToken.IsCancellationRequested) return RebalancingResult.Cancelled;
+            if (rebalancingToken.IsCancellationRequested) 
+                return new RebalancingPhaseResult(RebalancingResult.Cancelled);
 
             status.Version = setStatusRes.Data;
             InvokeOnStopActions();
@@ -242,9 +253,9 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
             if (clientsRes.Result != ZkResult.Ok)
             {
                 if (setStatusRes.Result == ZkResult.SessionExpired)
-                    return RebalancingResult.SessionExpired;
+                    return new RebalancingPhaseResult(RebalancingResult.SessionExpired);
                 
-                return RebalancingResult.Failure;
+                return new RebalancingPhaseResult(RebalancingResult.Failure);
             }
 
             var clients = clientsRes.Data;
@@ -253,13 +264,14 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
             if (resourcesRes.Result != ZkResult.Ok)
             {
                 if (setStatusRes.Result == ZkResult.SessionExpired)
-                    return RebalancingResult.SessionExpired;
+                    return new RebalancingPhaseResult(RebalancingResult.SessionExpired);
                 
-                return RebalancingResult.Failure;
+                return new RebalancingPhaseResult(RebalancingResult.Failure);
             }
             var resources = resourcesRes.Data;
             
-            if (rebalancingToken.IsCancellationRequested) return RebalancingResult.Cancelled;
+            if (rebalancingToken.IsCancellationRequested) 
+                return new RebalancingPhaseResult(RebalancingResult.Cancelled);
             
             // wait for confirmation that all followers have stopped or for time limit
             bool allActivityStopped = false;
@@ -269,7 +281,7 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
                 if(stoppedRes.Result == ZkResult.Ok)
                     allActivityStopped = IsClientListMatch(clients.ClientPaths, stoppedRes.Data);
                 else if (stoppedRes.Result == ZkResult.SessionExpired)
-                    return RebalancingResult.SessionExpired;
+                    return new RebalancingPhaseResult(RebalancingResult.SessionExpired);
                 else
                     await WaitFor(1000); // try again in 1s
             }
@@ -277,13 +289,21 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
             if (sw.Elapsed > this.rebalancingTimeLimit)
             {
                 logger.Error($"Rebalancing aborted, exceeded time limit of {this.rebalancingTimeLimit}");
-                return RebalancingResult.TimeLimitExceeded;
+                return new RebalancingPhaseResult(RebalancingResult.TimeLimitExceeded);
             }
 
-            if (rebalancingToken.IsCancellationRequested) return RebalancingResult.Cancelled;
+            var phaseResult = new RebalancingPhaseResult(RebalancingResult.Complete);
+            phaseResult.ResourcesZnode = resources;
+            phaseResult.ClientsZnode = clients;
             
-            //======== PHASE 2 - ASSIGN RESOURCES TO CLIENTS  ================
-            logger.Info("PHASE 2 - ASSIGN RESOURCES TO CLIENTS");
+            return phaseResult;
+        }
+
+        private async Task<RebalancingPhaseResult> AssignResourcesPhaseAsync(CancellationToken rebalancingToken,
+            ResourcesZnode resources,
+            ClientsZnode clients)
+        {
+            logger.Info("PHASE 2 - Assign resources to clients");
             var resourcesToAssign = new Queue<string>(resources.Resources);
             var resourceAssignments = new List<ResourceAssignment>();
             var clientIndex = 0;
@@ -306,34 +326,33 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
             if (setResourcesRes.Result != ZkResult.Ok)
             {
                 if (setResourcesRes.Result == ZkResult.BadVersion)
-                    return RebalancingResult.NotCoordinator;
+                    return new RebalancingPhaseResult(RebalancingResult.NotCoordinator);
                 if (setResourcesRes.Result == ZkResult.SessionExpired)
-                    return RebalancingResult.SessionExpired;
+                    return new RebalancingPhaseResult(RebalancingResult.SessionExpired);
 
-                return RebalancingResult.Failure;
+                return new RebalancingPhaseResult(RebalancingResult.Failure);
             }
             
             resources.Version = setResourcesRes.Data;
             
             // set status to ResourcesGranted
-            if (rebalancingToken.IsCancellationRequested) return RebalancingResult.Cancelled;
+            if (rebalancingToken.IsCancellationRequested) 
+                return new RebalancingPhaseResult(RebalancingResult.Cancelled);
             
             this.status.CoordinatorStatus = CoordinatorStatus.ResourcesGranted;
-            setStatusRes = await this.zooKeeperService.SetStatus(this.status);
+            var setStatusRes = await this.zooKeeperService.SetStatus(this.status);
             if (setStatusRes.Result != ZkResult.Ok)
             {
                 if (setStatusRes.Result == ZkResult.BadVersion)
-                    return RebalancingResult.NotCoordinator;
+                    return new RebalancingPhaseResult(RebalancingResult.NotCoordinator);
                 if (setStatusRes.Result == ZkResult.SessionExpired)
-                    return RebalancingResult.SessionExpired;
+                    return new RebalancingPhaseResult(RebalancingResult.SessionExpired);
 
-                return RebalancingResult.Failure;
+                return new RebalancingPhaseResult(RebalancingResult.Failure);
             }
 
             this.status.Version = setStatusRes.Data;
-
-            //======== PHASE 3 - START CONSUMPTION LOCALLY  ================
-            logger.Info("PHASE 3 - START CONSUMPTION LOCALLY");
+            
             var leaderAssignments = resourceAssignments.Where(x => x.ClientId == this.clientId).ToList();
             this.store.SetResources(new SetResourcesRequest()
             {
@@ -342,9 +361,20 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
             });
             InvokeOnStartActions();
             
-            //======== PHASE 4 - VERIFY ALL FOLLOWERS HAVE STARTED  ================
-            logger.Info("PHASE 4 - VERIFY ALL FOLLOWERS HAVE STARTED");
-            if (rebalancingToken.IsCancellationRequested) return RebalancingResult.Cancelled;
+            var phaseResult = new RebalancingPhaseResult(RebalancingResult.Complete);
+            phaseResult.ResourcesZnode = resources;
+            phaseResult.ClientsZnode = clients;
+            
+            return phaseResult;
+        }
+
+        private async Task<RebalancingPhaseResult> VerifyStartedPhaseAsync(CancellationToken rebalancingToken,
+            Stopwatch sw)
+        {
+            logger.Info("PHASE 3 - Verify all followers have started");
+            if (rebalancingToken.IsCancellationRequested) 
+                return new RebalancingPhaseResult(RebalancingResult.Cancelled);
+            
             bool allActivityStarted = false;
             while (!allActivityStarted || sw.Elapsed > this.rebalancingTimeLimit)
             {
@@ -352,7 +382,7 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
                 if(stoppedRes.Result == ZkResult.Ok)
                     allActivityStarted = !stoppedRes.Data.Any();    
                 else if (stoppedRes.Result == ZkResult.SessionExpired)
-                    return RebalancingResult.SessionExpired;
+                    return new RebalancingPhaseResult(RebalancingResult.SessionExpired);
                 else
                     await WaitFor(1000); // try again in 1s
             }
@@ -360,27 +390,25 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
             if (sw.Elapsed > this.rebalancingTimeLimit)
             {
                 logger.Error($"Rebalancing aborted, exceeded time limit of {this.rebalancingTimeLimit}");
-                return RebalancingResult.TimeLimitExceeded;
+                return new RebalancingPhaseResult(RebalancingResult.TimeLimitExceeded);
             }
 
             status.CoordinatorStatus = CoordinatorStatus.StartConfirmed;
-            setStatusRes = await this.zooKeeperService.SetStatus(status);
-            
+            var setStatusRes = await this.zooKeeperService.SetStatus(status);
             if (setStatusRes.Result != ZkResult.Ok)
             {
                 if (setStatusRes.Result == ZkResult.BadVersion)
-                    return RebalancingResult.NotCoordinator;
+                    return new RebalancingPhaseResult(RebalancingResult.NotCoordinator);
                 if (setStatusRes.Result == ZkResult.SessionExpired)
-                    return RebalancingResult.SessionExpired;
+                    return new RebalancingPhaseResult(RebalancingResult.SessionExpired);
 
-                return RebalancingResult.Failure;
+                return new RebalancingPhaseResult(RebalancingResult.Failure);
             }
-            status.Version = setStatusRes.Data;
             
-            // =============== COMPLETE =======================
-            return RebalancingResult.Complete;
+            this.status.Version = setStatusRes.Data;
+            return new RebalancingPhaseResult(RebalancingResult.Complete);
         }
-
+        
         private bool IsClientListMatch(List<string> clientPaths, List<string> stoppedPaths)
         {
             var clientIds = clientPaths.Select(x => GetClientId(x)).Where(x => !x.Equals(this.clientId)).OrderBy(x => x);
