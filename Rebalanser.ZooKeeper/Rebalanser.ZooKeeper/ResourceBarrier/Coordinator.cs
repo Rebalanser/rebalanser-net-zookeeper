@@ -10,15 +10,13 @@ using Rebalanser.Core.Logging;
 using Rebalanser.ZooKeeper.Store;
 using Rebalanser.ZooKeeper.Zk;
 
-namespace Rebalanser.ZooKeeper.GlobalBarrier
+namespace Rebalanser.ZooKeeper.ResourceBarrier
 {
     public class Coordinator : Watcher, ICoordinator
     {
-
         private IZooKeeperService zooKeeperService;
         private ILogger logger;
         private ResourceGroupStore store;
-        private StatusZnode status;
         private TimeSpan rebalancingTimeLimit;
         private OnChangeActions onChangeActions;
         private Task rebalancingTask;
@@ -27,6 +25,7 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
         private bool pendingRebalancing;
         private CoordinatorExitReason eventCoordinatorExitReason;
         private string clientId;
+        private int resourcesVersion;
 
         public Coordinator(IZooKeeperService zooKeeperService,
             ILogger logger,
@@ -44,42 +43,7 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
             this.coordinatorToken = coordinatorToken;
             this.rebalancingCts = new CancellationTokenSource();
         }
-
-        public async Task<BecomeCoordinatorResult> BecomeCoordinatorAsync(int currentEpoch)
-        {
-            var incEpochRes = await this.zooKeeperService.IncrementEpochAsync(currentEpoch);
-            if (incEpochRes.Result != ZkResult.Ok)
-            {
-                if(incEpochRes.Result == ZkResult.BadVersion)
-                    return BecomeCoordinatorResult.StaleEpoch;
-
-                return BecomeCoordinatorResult.Error;
-            }
-            
-            var watchEpochRes = await this.zooKeeperService.WatchEpochAsync(this);
-            if (watchEpochRes.Result != ZkResult.Ok)
-                return BecomeCoordinatorResult.Error;
-            
-            if(watchEpochRes.Data != incEpochRes.Data)
-                return BecomeCoordinatorResult.StaleEpoch;
-            
-            var watchNodesRes = await this.zooKeeperService.WatchNodesAsync(this);
-            if (watchNodesRes != ZkResult.Ok)
-                return BecomeCoordinatorResult.Error;
-            
-            var watchResourcesRes = await this.zooKeeperService.WatchResourcesChildrenAsync(this);
-            if (watchResourcesRes != ZkResult.Ok)
-                return BecomeCoordinatorResult.Error;
-            
-            var getStatusRes = await this.zooKeeperService.GetStatusAsync();
-            if (getStatusRes.Result != ZkResult.Ok)
-                return BecomeCoordinatorResult.Error;
-
-            this.status = getStatusRes.Data;
-            this.pendingRebalancing = true;
-            return BecomeCoordinatorResult.Ok;
-        }
-
+        
         public override async Task process(WatchedEvent @event)
         {
             if (this.coordinatorToken.IsCancellationRequested)
@@ -109,6 +73,42 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
             }
 
             await Task.Yield();
+        }
+        
+        public async Task<BecomeCoordinatorResult> BecomeCoordinatorAsync(int currentEpoch)
+        {
+            var incEpochRes = await this.zooKeeperService.IncrementEpochAsync(currentEpoch);
+            if (incEpochRes.Result != ZkResult.Ok)
+            {
+                if(incEpochRes.Result == ZkResult.BadVersion)
+                    return BecomeCoordinatorResult.StaleEpoch;
+
+                return BecomeCoordinatorResult.Error;
+            }
+            
+            var watchEpochRes = await this.zooKeeperService.WatchEpochAsync(this);
+            if (watchEpochRes.Result != ZkResult.Ok)
+                return BecomeCoordinatorResult.Error;
+            
+            if(watchEpochRes.Data != incEpochRes.Data)
+                return BecomeCoordinatorResult.StaleEpoch;
+            
+            var watchNodesRes = await this.zooKeeperService.WatchNodesAsync(this);
+            if (watchNodesRes != ZkResult.Ok)
+                return BecomeCoordinatorResult.Error;
+            
+            var watchResourcesRes = await this.zooKeeperService.WatchResourcesChildrenAsync(this);
+            if (watchResourcesRes != ZkResult.Ok)
+                return BecomeCoordinatorResult.Error;
+
+            var getResourcesRes = await this.zooKeeperService.GetResourcesAsync();
+            if (getResourcesRes.Result != ZkResult.Ok)
+                return BecomeCoordinatorResult.Error;
+            
+            this.resourcesVersion = getResourcesRes.Data.Version;
+            
+            this.pendingRebalancing = true;
+            return BecomeCoordinatorResult.Ok;
         }
 
         public async Task<CoordinatorExitReason> StartEventLoopAsync()
@@ -167,6 +167,16 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
             catch (TaskCanceledException)
             {}
         }
+        
+        private async Task WaitFor(int milliseconds, CancellationToken token)
+        {
+            try
+            {
+                await Task.Delay(milliseconds, token);
+            }
+            catch (TaskCanceledException)
+            {}
+        }
 
         private async Task TriggerRebalancing(CancellationToken rebalancingToken, int attempt)
         {
@@ -220,54 +230,15 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
         {
             var sw = new Stopwatch();
             sw.Start();
-
-            var stopPhaseResult = await StopActivityPhaseAsync(rebalancingToken, sw);
-            if (stopPhaseResult.PhaseResult != RebalancingResult.Complete)
-                return stopPhaseResult.PhaseResult;
             
-            var assignPhaseResult = await AssignResourcesPhaseAsync(rebalancingToken, 
-                stopPhaseResult.ResourcesZnode,
-                stopPhaseResult.ClientsZnode);
-            
-            if (assignPhaseResult.PhaseResult != RebalancingResult.Complete)
-                return assignPhaseResult.PhaseResult;
-
-            var verifyPhaseResult = await VerifyStartedPhaseAsync(rebalancingToken, sw);
-            if (verifyPhaseResult.PhaseResult != RebalancingResult.Complete)
-                return assignPhaseResult.PhaseResult;
-            
-            return RebalancingResult.Complete;
-        }
-
-        private async Task<RebalancingPhaseResult> StopActivityPhaseAsync(CancellationToken rebalancingToken, Stopwatch sw)
-        {
-            logger.Info("PHASE 1 - Command followers to stop");
-            status.RebalancingStatus = RebalancingStatus.StopActivity;
-            var setStatusRes = await this.zooKeeperService.SetStatus(status);
-            if (setStatusRes.Result != ZkResult.Ok)
-            {
-                if (setStatusRes.Result == ZkResult.BadVersion)
-                    return new RebalancingPhaseResult(RebalancingResult.NotCoordinator);
-                
-                if (setStatusRes.Result == ZkResult.SessionExpired)
-                    return new RebalancingPhaseResult(RebalancingResult.SessionExpired);
-
-                return new RebalancingPhaseResult(RebalancingResult.Failure);
-            }
-
-            if (rebalancingToken.IsCancellationRequested) 
-                return new RebalancingPhaseResult(RebalancingResult.Cancelled);
-
-            status.Version = setStatusRes.Data;
-            InvokeOnStopActions();
-            
+            logger.Info("PHASE 1 - Get clients and resources list");
             var clientsRes = await this.zooKeeperService.GetActiveClientsAsync();
             if (clientsRes.Result != ZkResult.Ok)
             {
                 if (clientsRes.Result == ZkResult.SessionExpired)
-                    return new RebalancingPhaseResult(RebalancingResult.SessionExpired);
+                    return RebalancingResult.SessionExpired;
                 
-                return new RebalancingPhaseResult(RebalancingResult.Failure);
+                return RebalancingResult.Failure;
             }
 
             var clients = clientsRes.Data;
@@ -276,45 +247,21 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
             if (resourcesRes.Result != ZkResult.Ok)
             {
                 if (resourcesRes.Result == ZkResult.SessionExpired)
-                    return new RebalancingPhaseResult(RebalancingResult.SessionExpired);
+                    return RebalancingResult.SessionExpired;
                 
-                return new RebalancingPhaseResult(RebalancingResult.Failure);
+                return RebalancingResult.Failure;
             }
+            
             var resources = resourcesRes.Data;
-            
+            if (resources.Version != this.resourcesVersion)
+            {
+                this.logger.Error("Resources znode version does not match expected value, indicates another client has been made coordinator and is executing a rebalancing. Stopping being coordinator now.");
+                return RebalancingResult.NotCoordinator;
+            }
+
             if (rebalancingToken.IsCancellationRequested) 
-                return new RebalancingPhaseResult(RebalancingResult.Cancelled);
+                return RebalancingResult.Cancelled;
             
-            // wait for confirmation that all followers have stopped or for time limit
-            bool allActivityStopped = false;
-            while (!allActivityStopped && sw.Elapsed < this.rebalancingTimeLimit && !rebalancingToken.IsCancellationRequested)
-            {
-                var stoppedRes = await this.zooKeeperService.GetStoppedAsync();
-                if(stoppedRes.Result == ZkResult.Ok)
-                    allActivityStopped = IsClientListMatch(clients.ClientPaths, stoppedRes.Data);
-                else if (stoppedRes.Result == ZkResult.SessionExpired)
-                    return new RebalancingPhaseResult(RebalancingResult.SessionExpired);
-                else
-                    await WaitFor(1000); // try again in 1s
-            }
-
-            if (sw.Elapsed > this.rebalancingTimeLimit)
-            {
-                logger.Error($"Rebalancing aborted, exceeded time limit of {this.rebalancingTimeLimit}");
-                return new RebalancingPhaseResult(RebalancingResult.TimeLimitExceeded);
-            }
-
-            var phaseResult = new RebalancingPhaseResult(RebalancingResult.Complete);
-            phaseResult.ResourcesZnode = resources;
-            phaseResult.ClientsZnode = clients;
-            
-            return phaseResult;
-        }
-
-        private async Task<RebalancingPhaseResult> AssignResourcesPhaseAsync(CancellationToken rebalancingToken,
-            ResourcesZnode resources,
-            ClientsZnode clients)
-        {
             logger.Info("PHASE 2 - Assign resources to clients");
             var resourcesToAssign = new Queue<string>(resources.Resources);
             var resourceAssignments = new List<ResourceAssignment>();
@@ -338,34 +285,38 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
             if (setResourcesRes.Result != ZkResult.Ok)
             {
                 if (setResourcesRes.Result == ZkResult.BadVersion)
-                    return new RebalancingPhaseResult(RebalancingResult.NotCoordinator);
+                    return RebalancingResult.NotCoordinator;
                 if (setResourcesRes.Result == ZkResult.SessionExpired)
-                    return new RebalancingPhaseResult(RebalancingResult.SessionExpired);
+                    return RebalancingResult.SessionExpired;
 
-                return new RebalancingPhaseResult(RebalancingResult.Failure);
+                return RebalancingResult.Failure;
             }
             
-            resources.Version = setResourcesRes.Data;
+            this.resourcesVersion = setResourcesRes.Data;
             
-            // set status to ResourcesGranted
-            if (rebalancingToken.IsCancellationRequested) 
-                return new RebalancingPhaseResult(RebalancingResult.Cancelled);
-            
-            this.status.RebalancingStatus = RebalancingStatus.ResourcesGranted;
-            var setStatusRes = await this.zooKeeperService.SetStatus(this.status);
-            if (setStatusRes.Result != ZkResult.Ok)
-            {
-                if (setStatusRes.Result == ZkResult.BadVersion)
-                    return new RebalancingPhaseResult(RebalancingResult.NotCoordinator);
-                if (setStatusRes.Result == ZkResult.SessionExpired)
-                    return new RebalancingPhaseResult(RebalancingResult.SessionExpired);
-
-                return new RebalancingPhaseResult(RebalancingResult.Failure);
-            }
-
-            this.status.Version = setStatusRes.Data;
-            
+            logger.Info("PHASE 3 - Remove any existing barriers, place new resource barriers and invoke start actions");
             var leaderAssignments = resourceAssignments.Where(x => x.ClientId == this.clientId).ToList();
+            var currAssignmentRes = this.store.GetResources();
+            
+            foreach (var resource in currAssignmentRes.Resources)
+            {
+                var removeBarrierRes = await this.zooKeeperService.RemoveResourceBarrierAsync(resource);
+                if(removeBarrierRes != ZkResult.Ok)
+                    return RebalancingResult.Failure;
+            }
+
+            foreach (var newResource in leaderAssignments)
+            {
+                var barrierAdded = await TryPutResourceBarrierAsync(newResource.Resource, sw, rebalancingToken);
+                if (!barrierAdded)
+                {
+                    if (rebalancingToken.IsCancellationRequested)
+                        return RebalancingResult.Cancelled;
+                    if (sw.Elapsed > this.rebalancingTimeLimit)
+                        return RebalancingResult.TimeLimitExceeded;
+                }
+            }
+            
             this.store.SetResources(new SetResourcesRequest()
             {
                 AssignmentStatus = AssignmentStatus.ResourcesAssigned, 
@@ -373,60 +324,27 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
             });
             InvokeOnStartActions();
             
-            var phaseResult = new RebalancingPhaseResult(RebalancingResult.Complete);
-            phaseResult.ResourcesZnode = resources;
-            phaseResult.ClientsZnode = clients;
-            
-            return phaseResult;
+            return RebalancingResult.Complete;
         }
 
-        private async Task<RebalancingPhaseResult> VerifyStartedPhaseAsync(CancellationToken rebalancingToken,
-            Stopwatch sw)
+        private async Task<bool> TryPutResourceBarrierAsync(string resource, Stopwatch sw, CancellationToken token)
         {
-            logger.Info("PHASE 3 - Verify all followers have started");
-            if (rebalancingToken.IsCancellationRequested) 
-                return new RebalancingPhaseResult(RebalancingResult.Cancelled);
-            
-            bool allActivityStarted = false;
-            while (!allActivityStarted || sw.Elapsed > this.rebalancingTimeLimit)
+            while (!token.IsCancellationRequested && sw.Elapsed < this.rebalancingTimeLimit)
             {
-                var stoppedRes = await this.zooKeeperService.GetStoppedAsync();
-                if(stoppedRes.Result == ZkResult.Ok)
-                    allActivityStarted = !stoppedRes.Data.Any();    
-                else if (stoppedRes.Result == ZkResult.SessionExpired)
-                    return new RebalancingPhaseResult(RebalancingResult.SessionExpired);
-                else
-                    await WaitFor(1000); // try again in 1s
+                var putBarrierRes = await this.zooKeeperService.TryPutResourceBarrierAsync(resource);
+                if (putBarrierRes == ZkResult.Ok)
+                    return true;
+
+                if (putBarrierRes == ZkResult.NodeAlreadyExists)
+                {
+                    await WaitFor(1000, token);
+                    continue;
+                }
+
+                return false;
             }
 
-            if (sw.Elapsed > this.rebalancingTimeLimit)
-            {
-                logger.Error($"Rebalancing aborted, exceeded time limit of {this.rebalancingTimeLimit}");
-                return new RebalancingPhaseResult(RebalancingResult.TimeLimitExceeded);
-            }
-
-            status.RebalancingStatus = RebalancingStatus.StartConfirmed;
-            var setStatusRes = await this.zooKeeperService.SetStatus(status);
-            if (setStatusRes.Result != ZkResult.Ok)
-            {
-                if (setStatusRes.Result == ZkResult.BadVersion)
-                    return new RebalancingPhaseResult(RebalancingResult.NotCoordinator);
-                if (setStatusRes.Result == ZkResult.SessionExpired)
-                    return new RebalancingPhaseResult(RebalancingResult.SessionExpired);
-
-                return new RebalancingPhaseResult(RebalancingResult.Failure);
-            }
-            
-            this.status.Version = setStatusRes.Data;
-            return new RebalancingPhaseResult(RebalancingResult.Complete);
-        }
-        
-        private bool IsClientListMatch(List<string> clientPaths, List<string> stoppedPaths)
-        {
-            var clientIds = clientPaths.Select(x => GetClientId(x)).Where(x => !x.Equals(this.clientId)).OrderBy(x => x);
-            var stoppedClientIds = stoppedPaths.Select(x => GetClientId(x)).OrderBy(x => x);
-
-            return clientIds.SequenceEqual(stoppedClientIds);
+            return false;
         }
 
         private string GetClientId(string clientPath)
@@ -445,5 +363,8 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
             foreach(var onStartAction in this.onChangeActions.OnStartActions)
                 onStartAction.Invoke();
         }
+
+
+        
     }
 }

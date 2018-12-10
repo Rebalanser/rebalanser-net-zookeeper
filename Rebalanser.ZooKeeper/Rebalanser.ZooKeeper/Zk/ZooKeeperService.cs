@@ -26,7 +26,7 @@ namespace Rebalanser.ZooKeeper.Zk
             this.logger = logger;
         }
         
-        public async Task<bool> InitializeAsync(string clientsPath,
+        public async Task<bool> InitializeGlobalBarrierAsync(string clientsPath,
             string statusPath,
             string stoppedPath,
             string resourcesPath,
@@ -63,6 +63,38 @@ namespace Rebalanser.ZooKeeper.Zk
             if (stoppedPathRes != ZkResult.Ok)
             {
                 this.logger.Error($"znode {this.stoppedPath} does not exist and could not be created");
+                return false;
+            }
+            
+            var resourcesPathRes = await EnsurePathAsync(this.resourcesPath);
+            if (resourcesPathRes != ZkResult.Ok)
+            {
+                this.logger.Error($"znode {this.resourcesPath} does not exist and could not be created");
+                return false;
+            }
+
+            return true;
+        }
+        
+        public async Task<bool> InitializeResourceBarrierAsync(string clientsPath,
+            string resourcesPath,
+            string epochPath)
+        {
+            this.clientsPath = clientsPath;
+            this.resourcesPath = resourcesPath;
+            this.epochPath = epochPath;
+
+            var clientsPathRes = await EnsurePathAsync(this.clientsPath);
+            if (clientsPathRes != ZkResult.Ok)
+            {
+                this.logger.Error($"znode {this.clientsPath} does not exist and could not be created");
+                return false;
+            }
+            
+            var epochPathRes = await EnsurePathAsync(this.epochPath);
+            if (epochPathRes != ZkResult.Ok)
+            {
+                this.logger.Error($"znode {this.epochPath} does not exist and could not be created");
                 return false;
             }
             
@@ -214,7 +246,7 @@ namespace Rebalanser.ZooKeeper.Zk
             try
             {
                 var data = System.Text.Encoding.UTF8.GetBytes("0");
-                var stat = await zookeeper.setDataAsync(this.statusPath, data, currentEpoch);
+                var stat = await zookeeper.setDataAsync(this.epochPath, data, currentEpoch);
                 return new ZkResponse<int>(ZkResult.Ok, stat.getVersion());
             }
             catch (KeeperException.BadVersionException e)
@@ -289,13 +321,13 @@ namespace Rebalanser.ZooKeeper.Zk
             try
             {
                 var dataResult = await zookeeper.getDataAsync(this.statusPath);
-                var status = CoordinatorStatus.NotSet;
+                var status = RebalancingStatus.NotSet;
                 if (dataResult.Stat.getDataLength() > 0)
-                    status = (CoordinatorStatus) BitConverter.ToInt32(dataResult.Data, 0);
+                    status = (RebalancingStatus) BitConverter.ToInt32(dataResult.Data, 0);
                         
                 return new ZkResponse<StatusZnode>(ZkResult.Ok, new StatusZnode()
                 {
-                    CoordinatorStatus = status,
+                    RebalancingStatus = status,
                     Version = dataResult.Stat.getVersion()
                 });
             }
@@ -325,7 +357,7 @@ namespace Rebalanser.ZooKeeper.Zk
         {
             try
             {
-                var data = BitConverter.GetBytes((int) statusZnode.CoordinatorStatus);
+                var data = BitConverter.GetBytes((int) statusZnode.RebalancingStatus);
                 var stat = await zookeeper.setDataAsync(this.statusPath, data, statusZnode.Version);
                 return new ZkResponse<int>(ZkResult.Ok, stat.getVersion());
             }
@@ -501,6 +533,72 @@ namespace Rebalanser.ZooKeeper.Zk
             }
         }
 
+        public async Task<ZkResult> RemoveResourceBarrierAsync(string resource)
+        {
+            try
+            {
+                await this.zookeeper.deleteAsync($"{this.resourcesPath}/{resource}/barrier");
+                return ZkResult.Ok;
+            }
+            catch (KeeperException.NoNodeException e)
+            {
+                return ZkResult.Ok;
+            }
+            catch (KeeperException.ConnectionLossException e)
+            {
+                this.logger.Error("Could not remove barrier from the resource as the connection has been lost: " + e);
+                return ZkResult.ConnectionLost;
+            }
+            catch (KeeperException.SessionExpiredException e)
+            {
+                this.logger.Error("Could not remove barrier from the resource as the session has expired: " + e);
+                return ZkResult.SessionExpired;
+            }
+            catch (Exception e)
+            {
+                this.logger.Error("Could not remove barrier from the resource: " + e);
+                return ZkResult.UnexpectedError;
+            }
+        }
+        
+        public async Task<ZkResult> TryPutResourceBarrierAsync(string resource)
+        {
+            try
+            {
+                await this.zookeeper.createAsync(
+                    $"{this.resourcesPath}/{resource}/barrier",
+                    System.Text.Encoding.UTF8.GetBytes("0"),
+                    ZooDefs.Ids.OPEN_ACL_UNSAFE,
+                    CreateMode.EPHEMERAL);
+                return ZkResult.Ok;
+            }
+            catch (KeeperException.NodeExistsException)
+            {
+                return ZkResult.NodeAlreadyExists;
+            }
+            catch (KeeperException.NoNodeException e)
+            {
+                this.logger.Error("Could not add a barrier to the resource as the resources node does not exist: " +
+                                  e);
+                return ZkResult.NoZnode;
+            }
+            catch (KeeperException.ConnectionLossException e)
+            {
+                this.logger.Error("Could not add a barrier to the resource as the connection has been lost: " + e);
+                return ZkResult.ConnectionLost;
+            }
+            catch (KeeperException.SessionExpiredException e)
+            {
+                this.logger.Error("Could not add a barrier to the resource as the session has expired: " + e);
+                return ZkResult.SessionExpired;
+            }
+            catch (Exception e)
+            {
+                this.logger.Error("Could not add a barrier to the resource: " + e);
+                return ZkResult.UnexpectedError;
+            }
+        }
+        
         public async Task<ZkResponse<List<string>>> GetStoppedAsync()
         {
             try
@@ -566,7 +664,7 @@ namespace Rebalanser.ZooKeeper.Zk
                 var dataResult = await zookeeper.getDataAsync(this.statusPath, watcher);
                 return new ZkResponse<StatusZnode>(ZkResult.Ok, new StatusZnode()
                 {
-                    CoordinatorStatus = (CoordinatorStatus) BitConverter.ToInt32(dataResult.Data, 0),
+                    RebalancingStatus = (RebalancingStatus) BitConverter.ToInt32(dataResult.Data, 0),
                     Version = dataResult.Stat.getVersion()
                 });
             }
@@ -592,7 +690,7 @@ namespace Rebalanser.ZooKeeper.Zk
             }
         }
         
-        public async Task<ZkResult> WatchResourcesAsync(Watcher watcher)
+        public async Task<ZkResult> WatchResourcesChildrenAsync(Watcher watcher)
         {
             try
             {
@@ -621,6 +719,35 @@ namespace Rebalanser.ZooKeeper.Zk
             }
         }
 
+        public async Task<ZkResult> WatchResourcesDataAsync(Watcher watcher)
+        {
+            try
+            {
+                await this.zookeeper.getDataAsync(this.resourcesPath, watcher);
+                return ZkResult.Ok;
+            }
+            catch (KeeperException.NoNodeException e)
+            {
+                this.logger.Error("Could not set a data watch on resource znode as the resources znode does not exist: " + e);
+                return ZkResult.NoZnode;
+            }
+            catch (KeeperException.ConnectionLossException e)
+            {
+                this.logger.Error("Could not set a data watch on resource znode as the connection has been lost: " + e);
+                return ZkResult.ConnectionLost;
+            }
+            catch (KeeperException.SessionExpiredException e)
+            {
+                this.logger.Error("Could not set a data watch on resource znode as the session has expired: " + e);
+                return ZkResult.SessionExpired;
+            }
+            catch (Exception e)
+            {
+                this.logger.Error("Could not set a data watch on resource znode: " + e);
+                return ZkResult.UnexpectedError;
+            }
+        }
+        
         public async Task<ZkResult> WatchNodesAsync(Watcher watcher)
         {
             try

@@ -10,8 +10,4 @@
       <PackageReference Include="ZooKeeperNetEx" Version="3.4.12" />
     </ItemGroup>
 
-    <ItemGroup>
-      <Folder Include="ResourceBarrier" />
-    </ItemGroup>
-
 </Project>

@@ -10,9 +10,12 @@ namespace Rebalanser.ZooKeeper.Zk
         Watcher.Event.KeeperState GetKeeperState();
         Task StartSessionAsync(TimeSpan sessionTimeout);
         Task CloseSessionAsync();
-        Task<bool> InitializeAsync(string clientsPath,
+        Task<bool> InitializeGlobalBarrierAsync(string clientsPath,
             string statusPath,
             string stoppedPath,
+            string resourcesPath,
+            string epochPath);
+        Task<bool> InitializeResourceBarrierAsync(string clientsPath,
             string resourcesPath,
             string epochPath);
         Task<ZkResult> DeleteClientAsync(string clientPath);
@@ -28,9 +31,12 @@ namespace Rebalanser.ZooKeeper.Zk
         Task<ZkResponse<ResourcesZnode>> GetResourcesAsync();
         Task<ZkResponse<int>> SetResourcesAsync(ResourcesZnode resourcesZnode);
         Task<ZkResponse<List<string>>> GetStoppedAsync();
+        Task<ZkResult> RemoveResourceBarrierAsync(string resourcePath);
+        Task<ZkResult> TryPutResourceBarrierAsync(string resourcePath);
         Task<ZkResponse<int>> WatchEpochAsync(Watcher watcher);
         Task<ZkResponse<StatusZnode>> WatchStatusAsync(Watcher watcher);
-        Task<ZkResult> WatchResourcesAsync(Watcher watcher);
+        Task<ZkResult> WatchResourcesChildrenAsync(Watcher watcher);
+        Task<ZkResult> WatchResourcesDataAsync(Watcher watcher);
         Task<ZkResult> WatchNodesAsync(Watcher watcher);
         Task<ZkResult> WatchSiblingNodeAsync(string siblingPath, Watcher watcher);
     }

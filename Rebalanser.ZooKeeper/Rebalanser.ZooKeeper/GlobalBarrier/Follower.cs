@@ -19,7 +19,7 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
         private int clientNumber;
         private OnChangeActions onChangeActions;
         private CancellationToken followerToken;
-        private FollowerExitReason eventExitReason;
+        private FollowerStatus eventExitReason;
         private bool statusChange;
         private string watchSiblingPath;
         private string siblingId;
@@ -73,7 +73,7 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
         {
             if (@event.getState() == Event.KeeperState.Expired)
             {
-                this.eventExitReason = FollowerExitReason.SessionExpired;
+                this.eventExitReason = FollowerStatus.SessionExpired;
             }
             // if the sibling client has been removed then this client must either be the new leader
             // or the node needs to monitor the next smallest client
@@ -85,10 +85,10 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
                     case SiblingCheckResult.WatchingNewSibling:
                         break;
                     case SiblingCheckResult.IsNewLeader:
-                        eventExitReason = FollowerExitReason.IsNewLeader;
+                        eventExitReason = FollowerStatus.IsNewLeader;
                         break;
                     case SiblingCheckResult.Error:
-                        eventExitReason = FollowerExitReason.UnexpectedFailure;
+                        eventExitReason = FollowerStatus.UnexpectedFailure;
                         break;
                     default:
                         this.logger.Error($"Non-supported SiblingCheckResult {siblingResult}");
@@ -108,14 +108,14 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
             await Task.Yield();
         }
         
-        public async Task<FollowerExitReason> StartEventLoopAsync()
+        public async Task<FollowerStatus> StartEventLoopAsync()
         {
             int lastStopVersion = 0;
             int lastStartVersion = 0;
             
             while (!this.followerToken.IsCancellationRequested)
             {
-                if (this.eventExitReason != FollowerExitReason.NoExit)
+                if (this.eventExitReason != FollowerStatus.Ok)
                 {
                     InvokeOnStopActions();
                     return this.eventExitReason;
@@ -124,7 +124,7 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
                 if (this.statusChange)
                 {
                     var result = await ProcessStatusChangeAsync(lastStopVersion, lastStartVersion);
-                    if (result.ExitReason == FollowerExitReason.NoExit)
+                    if (result.ExitReason == FollowerStatus.Ok)
                     {
                         lastStartVersion = result.LastStartVersion;
                         lastStopVersion = result.LastStopVersion;
@@ -141,10 +141,10 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
             if (this.followerToken.IsCancellationRequested)
             {
                 await this.zooKeeperService.CloseSessionAsync();
-                return FollowerExitReason.Cancelled;
+                return FollowerStatus.Cancelled;
             }
 
-            return FollowerExitReason.UnexpectedFailure;
+            return FollowerStatus.UnexpectedFailure;
         }
 
         private async Task<StateChangeResult> ProcessStatusChangeAsync(int lastStopVersion, int lastStartVersion)
@@ -154,15 +154,15 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
             if (watchStatusRes.Result != ZkResult.Ok)
             {
                 if (watchStatusRes.Result == ZkResult.SessionExpired)
-                    return new StateChangeResult(FollowerExitReason.SessionExpired);
+                    return new StateChangeResult(FollowerStatus.SessionExpired);
 
-                return new StateChangeResult(FollowerExitReason.UnexpectedFailure);
+                return new StateChangeResult(FollowerStatus.UnexpectedFailure);
             }
 
-            var result = new StateChangeResult(FollowerExitReason.NoExit);
+            var result = new StateChangeResult(FollowerStatus.Ok);
             var status = watchStatusRes.Data;
             
-            if (status.CoordinatorStatus == CoordinatorStatus.StopActivity)
+            if (status.RebalancingStatus == RebalancingStatus.StopActivity)
             {
                 result.LastStopVersion = status.Version;
                 result.LastStartVersion = lastStartVersion;
@@ -174,22 +174,22 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
                     if (stoppedRes == ZkResult.NodeAlreadyExists && lastStopVersion > lastStartVersion)
                         this.logger.Info($"Two consecutive stop commands received. Last Stop Status Version: {lastStopVersion}, Last ResourceGranted Status Version: {lastStartVersion}");
                     else if (stoppedRes == ZkResult.SessionExpired)
-                        result.ExitReason = FollowerExitReason.SessionExpired;
+                        result.ExitReason = FollowerStatus.SessionExpired;
                     else
-                        result.ExitReason = FollowerExitReason.UnexpectedFailure;
+                        result.ExitReason = FollowerStatus.UnexpectedFailure;
                 }
             }
-            else if (status.CoordinatorStatus == CoordinatorStatus.ResourcesGranted)
+            else if (status.RebalancingStatus == RebalancingStatus.ResourcesGranted)
             {
                 if (lastStopVersion > 0)
                 {
                     var resourcesRes = await this.zooKeeperService.GetResourcesAsync();
                     if (resourcesRes.Result != ZkResult.Ok)
                     {
-                        if (watchStatusRes.Result == ZkResult.SessionExpired)
-                            result.ExitReason = FollowerExitReason.SessionExpired;
+                        if (resourcesRes.Result == ZkResult.SessionExpired)
+                            result.ExitReason = FollowerStatus.SessionExpired;
                         else
-                            result.ExitReason = FollowerExitReason.UnexpectedFailure;
+                            result.ExitReason = FollowerStatus.UnexpectedFailure;
                     }
                     else
                     {
@@ -210,10 +210,10 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
                         var startedRes = await this.zooKeeperService.SetFollowerAsStarted(this.clientId);
                         if (startedRes != ZkResult.Ok && startedRes != ZkResult.NoZnode)
                         {
-                            if (watchStatusRes.Result == ZkResult.SessionExpired)
-                                result.ExitReason = FollowerExitReason.SessionExpired;
+                            if (startedRes == ZkResult.SessionExpired)
+                                result.ExitReason = FollowerStatus.SessionExpired;
                             else
-                                result.ExitReason = FollowerExitReason.UnexpectedFailure;
+                                result.ExitReason = FollowerStatus.UnexpectedFailure;
                         }
                     }
                 }
@@ -225,7 +225,7 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
                 result.LastStartVersion = status.Version;
                 result.LastStopVersion = lastStopVersion;    
             }
-            else if (status.CoordinatorStatus == CoordinatorStatus.StartConfirmed)
+            else if (status.RebalancingStatus == RebalancingStatus.StartConfirmed)
             {
                 // do nothing
             }

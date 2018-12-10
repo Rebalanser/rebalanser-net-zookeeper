@@ -111,7 +111,7 @@ namespace ZkTester
             var zkProvider = new ZooKeeperProvider("localhost:2181", 
                 "/rebalanser", 
                 TimeSpan.FromMinutes(5),
-                RebalancingMode.GlobalBarrier,
+                RebalancingMode.ResourceBarrier,
                 new ConsoleLogger());
             Providers.Register(zkProvider);
             Random r = new Random(Guid.NewGuid().GetHashCode());

@@ -5,6 +5,6 @@ namespace Rebalanser.ZooKeeper
     public interface IFollower
     {
         Task<bool> BecomeFollowerAsync();
-        Task<FollowerExitReason> StartEventLoopAsync();
+        Task<FollowerStatus> StartEventLoopAsync();
     }
 }

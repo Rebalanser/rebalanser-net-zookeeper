@@ -1,6 +1,6 @@
 namespace Rebalanser.ZooKeeper.Zk
 {
-    public enum CoordinatorStatus
+    public enum RebalancingStatus
     {
         NotSet=0,
         StartConfirmed=1,

@@ -1,7 +1,8 @@
 namespace Rebalanser.ZooKeeper
 {
-    public enum SessionTermination
+    public enum SessionStatus
     {
+        Valid,
         Cancelled,
         Expired,
         CouldNotEstablishSession,

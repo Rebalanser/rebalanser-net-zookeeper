@@ -6,12 +6,12 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
         {
         }
         
-        public StateChangeResult(FollowerExitReason exitReason)
+        public StateChangeResult(FollowerStatus exitReason)
         {
             ExitReason = exitReason;
         }
         
-        public FollowerExitReason ExitReason { get; set; }
+        public FollowerStatus ExitReason { get; set; }
         public int LastStopVersion { get; set; }
         public int LastStartVersion { get; set; }
     }

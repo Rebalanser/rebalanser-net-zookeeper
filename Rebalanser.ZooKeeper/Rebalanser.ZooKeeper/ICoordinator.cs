@@ -4,7 +4,7 @@ namespace Rebalanser.ZooKeeper
 {
     public interface ICoordinator
     {
-        Task<bool> BecomeCoordinatorAsync();
+        Task<BecomeCoordinatorResult> BecomeCoordinatorAsync(int currentEpoch);
         Task<CoordinatorExitReason> StartEventLoopAsync();
     }
 }
