@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -58,7 +59,7 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
             if (watchSiblingRes != ZkResult.Ok)
             {
                 if(watchSiblingRes == ZkResult.NoZnode)
-                    this.logger.Info($"Could not set a watch on sibling node {this.watchSiblingPath} as it no longer exists");
+                    this.logger.Info(this.clientId, $"Follower - Could not set a watch on sibling node {this.watchSiblingPath} as it no longer exists");
                 return false;
             }
 
@@ -91,7 +92,7 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
                         eventExitReason = FollowerStatus.UnexpectedFailure;
                         break;
                     default:
-                        this.logger.Error($"Non-supported SiblingCheckResult {siblingResult}");
+                        this.logger.Error(this.clientId, $"Follower - Non-supported SiblingCheckResult {siblingResult}");
                         break;
                 }
             }
@@ -161,6 +162,13 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
 
             var result = new StateChangeResult(FollowerStatus.Ok);
             var status = watchStatusRes.Data;
+
+            // check for cancellation
+            if (this.followerToken.IsCancellationRequested)
+            {
+                result.ExitReason = FollowerStatus.Cancelled;
+                return result;
+            }
             
             if (status.RebalancingStatus == RebalancingStatus.StopActivity)
             {
@@ -168,11 +176,19 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
                 result.LastStartVersion = lastStartVersion;
                 
                 InvokeOnStopActions();
+                
+                // check for cancellation, stop actions can be of arbitrary time
+                if (this.followerToken.IsCancellationRequested)
+                {
+                    result.ExitReason = FollowerStatus.Cancelled;
+                    return result;
+                }
+                
                 var stoppedRes = await this.zooKeeperService.SetFollowerAsStopped(this.clientId);
                 if (stoppedRes != ZkResult.Ok)
                 {
                     if (stoppedRes == ZkResult.NodeAlreadyExists && lastStopVersion > lastStartVersion)
-                        this.logger.Info($"Two consecutive stop commands received. Last Stop Status Version: {lastStopVersion}, Last ResourceGranted Status Version: {lastStartVersion}");
+                        this.logger.Info(this.clientId, $"Follower - Two consecutive stop commands received. Last Stop Status Version: {lastStopVersion}, Last ResourceGranted Status Version: {lastStartVersion}");
                     else if (stoppedRes == ZkResult.SessionExpired)
                         result.ExitReason = FollowerStatus.SessionExpired;
                     else
@@ -205,7 +221,14 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
                             Resources = assignedResources
                         });
 
-                        InvokeOnStartActions();
+                        InvokeOnStartActions(assignedResources);
+                        
+                        // check for cancellation, start actions can be of arbitrary time
+                        if (this.followerToken.IsCancellationRequested)
+                        {
+                            result.ExitReason = FollowerStatus.Cancelled;
+                            return result;
+                        }
                         
                         var startedRes = await this.zooKeeperService.SetFollowerAsStarted(this.clientId);
                         if (startedRes != ZkResult.Ok && startedRes != ZkResult.NoZnode)
@@ -219,7 +242,7 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
                 }
                 else
                 {
-                    this.logger.Info("Ignoring ResourcesGranted status as did not receive a StopActivity notification. Likely I am a new follower.");
+                    this.logger.Info(this.clientId, "Follower - Ignoring ResourcesGranted status as did not receive a StopActivity notification. Likely I am a new follower.");
                 }
 
                 result.LastStartVersion = status.Version;
@@ -243,10 +266,10 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
                 onStopAction.Invoke();
         }
         
-        private void InvokeOnStartActions()
+        private void InvokeOnStartActions(List<string> assignedResources)
         {
             foreach(var onStartAction in this.onChangeActions.OnStartActions)
-                onStartAction.Invoke();
+                onStartAction.Invoke(assignedResources);
         }
         
         private async Task WaitFor(int milliseconds)
@@ -261,7 +284,7 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
 
         private async Task<SiblingCheckResult> CheckForSiblings()
         {
-            int maxClientNumber = 0;
+            int maxClientNumber = -1;
             string watchChild = string.Empty;
             var clientsRes = await this.zooKeeperService.GetActiveClientsAsync();
             if (clientsRes.Result != ZkResult.Ok)
@@ -278,7 +301,7 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
                 }
             }
 
-            if (maxClientNumber == 0)
+            if (maxClientNumber == -1)
                 return SiblingCheckResult.IsNewLeader;
             
             this.watchSiblingPath = watchChild;

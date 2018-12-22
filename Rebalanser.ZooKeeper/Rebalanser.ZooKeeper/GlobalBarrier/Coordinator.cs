@@ -129,7 +129,7 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
                 if (logicalTimeSinceRebalancingTrigger > 5 && pendingRebalancing)
                 {
                     await CancelRebalancingIfInProgressAsync();
-                    logger.Info("Rebalancing triggered");
+                    logger.Info(this.clientId, "Coordinator - Rebalancing triggered");
                     pendingRebalancing = false;
                     logicalTimeSinceRebalancingTrigger = 0;
                     rebalancingTask = Task.Run(async () => await TriggerRebalancing(this.rebalancingCts.Token, 1));
@@ -140,6 +140,7 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
 
             if (this.coordinatorToken.IsCancellationRequested)
             {
+                await CancelRebalancingIfInProgressAsync();
                 await this.zooKeeperService.CloseSessionAsync();
                 return CoordinatorExitReason.Cancelled;
             }
@@ -151,7 +152,7 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
         {
             if (this.rebalancingTask != null && !this.rebalancingTask.IsCompleted)
             {
-                logger.Info("Cancelling the rebalancing that is in progress");
+                logger.Info(this.clientId, "Coordinator - Cancelling the rebalancing that is in progress");
                 this.rebalancingCts.Cancel();
                 await this.rebalancingTask; // might need to put a time limit on this
                 this.rebalancingCts = new CancellationTokenSource(); // reset cts
@@ -176,17 +177,17 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
                 switch (result)
                 {
                     case RebalancingResult.Complete: 
-                        logger.Info("Rebalancing complete");
+                        logger.Info(this.clientId, "Coordinator - Rebalancing complete");
                         break;
                     case RebalancingResult.Cancelled:
-                        logger.Info("Rebalancing cancelled");
+                        logger.Info(this.clientId, "Coordinator - Rebalancing cancelled");
                         break;
                     case RebalancingResult.NotCoordinator:
-                        logger.Info("Rebalancing aborted, lost coordinator role");
+                        logger.Info(this.clientId, "Coordinator - Rebalancing aborted, lost coordinator role");
                         this.eventCoordinatorExitReason = CoordinatorExitReason.NotCoordinator;
                         break;
                     case RebalancingResult.SessionExpired:
-                        logger.Info("Rebalancing aborted, lost session");
+                        logger.Info(this.clientId, "Coordinator - Rebalancing aborted, lost session");
                         this.eventCoordinatorExitReason = CoordinatorExitReason.SessionExpired;
                         break;
                     case RebalancingResult.Failure:
@@ -198,20 +199,20 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
                         }
                         else
                         {
-                            this.logger.Error($"Rebalancing failed. Will retry again with attempt {attempt}");
+                            this.logger.Error(this.clientId, $"Coordinator - Rebalancing failed. Will retry again with attempt {attempt}");
                             await TriggerRebalancing(rebalancingToken, attempt);
                         }
 
                         break;
                     default: 
-                        this.logger.Error($"A non-supported RebalancingResult has been returned: {result}");
+                        this.logger.Error(this.clientId, $"Coordinator - A non-supported RebalancingResult has been returned: {result}");
                         this.eventCoordinatorExitReason = CoordinatorExitReason.RebalancingError;
                         break;
                 }
             }
             catch (Exception ex)
             {
-                this.logger.Error("An unexpected error has occurred, aborting rebalancing and becoming a follower", ex);
+                this.logger.Error(this.clientId, "Coordinator - An unexpected error has occurred, aborting rebalancing and becoming a follower", ex);
                 this.eventCoordinatorExitReason = CoordinatorExitReason.RebalancingError;
             }
         }
@@ -241,7 +242,7 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
 
         private async Task<RebalancingPhaseResult> StopActivityPhaseAsync(CancellationToken rebalancingToken, Stopwatch sw)
         {
-            logger.Info("PHASE 1 - Command followers to stop");
+            logger.Info(this.clientId, "Coordinator - PHASE 1 - Command followers to stop");
             status.RebalancingStatus = RebalancingStatus.StopActivity;
             var setStatusRes = await this.zooKeeperService.SetStatus(status);
             if (setStatusRes.Result != ZkResult.Ok)
@@ -300,7 +301,7 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
 
             if (sw.Elapsed > this.rebalancingTimeLimit)
             {
-                logger.Error($"Rebalancing aborted, exceeded time limit of {this.rebalancingTimeLimit}");
+                logger.Error(this.clientId, $"Coordinator - Rebalancing aborted, exceeded time limit of {this.rebalancingTimeLimit}");
                 return new RebalancingPhaseResult(RebalancingResult.TimeLimitExceeded);
             }
 
@@ -315,7 +316,7 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
             ResourcesZnode resources,
             ClientsZnode clients)
         {
-            logger.Info("PHASE 2 - Assign resources to clients");
+            logger.Info(this.clientId, "Coordinator - PHASE 2 - Assign resources to clients");
             var resourcesToAssign = new Queue<string>(resources.Resources);
             var resourceAssignments = new List<ResourceAssignment>();
             var clientIndex = 0;
@@ -371,7 +372,7 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
                 AssignmentStatus = AssignmentStatus.ResourcesAssigned, 
                 Resources = leaderAssignments.Select(x => x.Resource).ToList()
             });
-            InvokeOnStartActions();
+            InvokeOnStartActions(leaderAssignments.Select(x => x.Resource).ToList());
             
             var phaseResult = new RebalancingPhaseResult(RebalancingResult.Complete);
             phaseResult.ResourcesZnode = resources;
@@ -383,7 +384,7 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
         private async Task<RebalancingPhaseResult> VerifyStartedPhaseAsync(CancellationToken rebalancingToken,
             Stopwatch sw)
         {
-            logger.Info("PHASE 3 - Verify all followers have started");
+            logger.Info(this.clientId, "Coordinator - PHASE 3 - Verify all followers have started");
             if (rebalancingToken.IsCancellationRequested) 
                 return new RebalancingPhaseResult(RebalancingResult.Cancelled);
             
@@ -401,7 +402,7 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
 
             if (sw.Elapsed > this.rebalancingTimeLimit)
             {
-                logger.Error($"Rebalancing aborted, exceeded time limit of {this.rebalancingTimeLimit}");
+                logger.Error(this.clientId, $"Coordinator - Rebalancing aborted, exceeded time limit of {this.rebalancingTimeLimit}");
                 return new RebalancingPhaseResult(RebalancingResult.TimeLimitExceeded);
             }
 
@@ -440,10 +441,10 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
                 onStopAction.Invoke();
         }
         
-        private void InvokeOnStartActions()
+        private void InvokeOnStartActions(List<string> assignedResources)
         {
             foreach(var onStartAction in this.onChangeActions.OnStartActions)
-                onStartAction.Invoke();
+                onStartAction.Invoke(assignedResources);
         }
     }
 }

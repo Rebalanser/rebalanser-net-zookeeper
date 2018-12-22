@@ -21,6 +21,7 @@ namespace Rebalanser.ZooKeeper
         private ResourceGroupStore store;
         private RebalancingMode rebalancingMode;
         private TimeSpan sessionTimeout;
+        private TimeSpan connectTimeout;
         private int clientNumber;
         private string clientId;
         private string clientPath;
@@ -33,6 +34,7 @@ namespace Rebalanser.ZooKeeper
         public ZooKeeperProvider(string zookeeperHosts,
             string zookeeperRootPath,
             TimeSpan sessionTimeout,
+            TimeSpan connectTimeout,
             RebalancingMode rebalancingMode,
             ILogger logger,
             IZooKeeperService zooKeeperService=null)
@@ -40,10 +42,11 @@ namespace Rebalanser.ZooKeeper
             this.zooKeeperRootPath = zookeeperRootPath;
             this.rebalancingMode = rebalancingMode;
             this.sessionTimeout = sessionTimeout;
+            this.connectTimeout = connectTimeout;
             this.logger = logger;
             this.store = new ResourceGroupStore();
             this.clientPath = "";
-            this.clientId = "";
+            this.clientId = "Pending Id";
 
             if (zooKeeperService == null)
                 this.zooKeeperService = new ZooKeeperService(zookeeperHosts, logger);
@@ -51,13 +54,16 @@ namespace Rebalanser.ZooKeeper
                 this.zooKeeperService = zooKeeperService;
         }
 
-        public async Task StartAsync(string resourceGroup, OnChangeActions onChangeActions, CancellationToken token, ContextOptions contextOptions)
+        public async Task StartAsync(string resourceGroup, 
+            OnChangeActions onChangeActions, 
+            CancellationToken token, 
+            ClientOptions clientOptions)
         {
             // just in case someone does some concurrency
             lock (startLockObj)
             {
                 if (this.started)
-                    throw new RebalanserException("Context already started");
+                    throw new RebalanserException("Client already started");
 
                 this.started = true;
             }
@@ -68,106 +74,157 @@ namespace Rebalanser.ZooKeeper
             {
                 while (!token.IsCancellationRequested)
                 {
-                    var sessionTerm = await StartSessionAsync(onChangeActions, token, contextOptions);
-                    this.logger.Info($"Session terminated due to SessionTermination termination reason {sessionTerm}");
-                    if (sessionTerm == SessionStatus.Cancelled)
-                        break;
+                    var sessionTerm = await StartSessionAsync(onChangeActions, token, clientOptions);
+                    this.logger.Info("-", $"Session terminated due to SessionTermination termination reason {sessionTerm}");
 
-                    if (sessionTerm == SessionStatus.Expired || sessionTerm == SessionStatus.CouldNotEstablishSession)
+                    if (sessionTerm == ProcessStatus.Cancelled)
                     {
-                        this.logger.Info("A new session will be created in 5 seconds");
-                        await WaitFor(TimeSpan.FromSeconds(5), token);
-                        continue;
+                        InvokeOnStop(onChangeActions);
+                        break;
                     }
 
-                    if (sessionTerm == SessionStatus.NonRecoverableError)
+                    if (sessionTerm == ProcessStatus.ExpiredSession || sessionTerm == ProcessStatus.CouldNotEstablishSession)
                     {
-                        NotifyOfError(onChangeActions, "An unrecoverable error has occurred,that auto-recovery cannot handle. Check the log for details", contextOptions.AutoRecoveryOnError, null);
+                        if (clientOptions.AutoRecoveryOnError)
+                        {
+                            this.logger.Info(this.clientId, $"A new session will be created in {clientOptions.RestartDelay}");
+                            await WaitFor(clientOptions.RestartDelay, token);
+                            continue;
+                        }
+                        
+                        var message = "Lost or could not establish a ZooKeeper session. Auto-recovery is not configured.";
+                        NotifyOfError(onChangeActions, message, clientOptions.AutoRecoveryOnError, null);
+                        this.logger.Info(this.clientId, message);
+                        break;
+                    }
+
+                    if (sessionTerm == ProcessStatus.NonRecoverableError)
+                    {
+                        NotifyOfError(onChangeActions, "An unrecoverable error has occurred,that auto-recovery cannot handle. Check the log for details", clientOptions.AutoRecoveryOnError, null);
                         break;
                     }
                 }
                 
-                this.logger.Info("Rebalanser context terminated");
+                this.logger.Info(this.clientId, "Rebalanser client terminated");
                 this.started = false;
             });
 
             await Task.Yield();
         }
 
-        private async Task<SessionStatus> StartSessionAsync(OnChangeActions onChangeActions, 
+        private async Task<ProcessStatus> StartSessionAsync(OnChangeActions onChangeActions, 
             CancellationToken token, 
-            ContextOptions contextOptions)
+            ClientOptions clientOptions)
         {
-            var sessionStatus = await RegisterClientZnode();
-            if (sessionStatus != SessionStatus.Valid)
-                return sessionStatus;
+            var processStatus = await RegisterClientZnode();
+            if (processStatus != ProcessStatus.Valid)
+                return processStatus;
 
             while (!token.IsCancellationRequested && this.zooKeeperService.GetKeeperState() != Watcher.Event.KeeperState.Expired)
             {
-                this.logger.Info($"Entering current session context");
+                this.logger.Info(this.clientId, $"Entering current session client");
                 var connected = await BlockTillConnected(token);
                 if (!connected)
-                    break;
-                
+                {
+                    if(this.zooKeeperService.GetKeeperState() == Watcher.Event.KeeperState.Expired)
+                        return ProcessStatus.ExpiredSession;
+                    
+                    return ProcessStatus.CouldNotEstablishSession;
+                }
+
                 var epochRes = await this.zooKeeperService.GetEpochAsync();
                 if (epochRes.Result != ZkResult.Ok)
-                    return SessionStatus.NonRecoverableError;
+                {
+                    switch (epochRes.Result)
+                    {
+                        case ZkResult.ConnectionLost:
+                        case ZkResult.SessionExpired:
+                            return ProcessStatus.ExpiredSession;
+                        default:
+                            return ProcessStatus.NonRecoverableError;
+                    }
+                }
 
                 this.epoch = epochRes.Data;
-                
-                this.logger.Info($"Finding next smaller sibling to watch");
+
+                this.logger.Info(this.clientId, $"Finding next smaller sibling to watch");
                 var siblingPath = await GetSiblingToWatchAsync();
                 if (this.zooKeeperService.GetKeeperState() == Watcher.Event.KeeperState.Expired)
-                    return SessionStatus.Expired;
+                    return ProcessStatus.ExpiredSession;
 
                 if (siblingPath == string.Empty)
                 {
                     // this method exits when its status as coordinator has ended due to cancellation, session expiry,
                     // error or detecting loss of leadership
-                    sessionStatus = await RunAsCoordinatorAsync(onChangeActions, token);
-                    if (sessionStatus != SessionStatus.Valid)
-                        return sessionStatus;
+                    processStatus = await RunAsCoordinatorAsync(onChangeActions, token);
+                    switch (processStatus)
+                    {
+                        case ProcessStatus.Cancelled:
+                        case ProcessStatus.ExpiredSession:
+                        case ProcessStatus.NonRecoverableError:
+                        case ProcessStatus.CouldNotEstablishSession:
+                            return processStatus;
+                        case ProcessStatus.RoleChange:
+                        case ProcessStatus.Valid:
+                            continue;
+                        case ProcessStatus.ErrorWithValidSession:
+                            break;
+                    }
                 }
                 else
                 {
                     // this method exits when its status as follower has ended due to cancellation, session expiry,
                     // error or detecting it should be the coordinator
-                    sessionStatus = await RunAsFollowerAsync(onChangeActions, token, siblingPath);
-                    if (sessionStatus != SessionStatus.Valid)
-                        return sessionStatus;
+                    processStatus = await RunAsFollowerAsync(onChangeActions, token, siblingPath);
+                    switch (processStatus)
+                    {
+                        case ProcessStatus.Cancelled:
+                        case ProcessStatus.ExpiredSession:
+                        case ProcessStatus.NonRecoverableError:
+                        case ProcessStatus.CouldNotEstablishSession:
+                            return processStatus;
+                        case ProcessStatus.RoleChange:
+                            continue;
+                        case ProcessStatus.ErrorWithValidSession:
+                        case ProcessStatus.Valid:
+                            break;
+                    }
                 }
+                
 
                 // if we got here then neither cancellation nor some kind of session related error has occurred
                 // if we have auto-recovery enabled then we wait then try again with the existing session
                 // else we'll exit with a non-recoverable error code
-                if (contextOptions.AutoRecoveryOnError)
+                if (clientOptions.AutoRecoveryOnError)
                 {
-                    this.logger.Info($"Had to exit current role (coordinator or follower) and auto-recovery in progress. The session is still valid.");
-                    await WaitFor(contextOptions.RestartDelay, token);
+                    this.logger.Info(this.clientId, $"Had to exit current role (coordinator or follower) and auto-recovery in progress. The session is still valid.");
+                    await WaitFor(clientOptions.RestartDelay, token);
                 }
                 else
                 {
-                    this.logger.Info($"Had to exit current role (coordinator or follower) and auto-recovery is disabled. Exiting the current session context.");
-                    return SessionStatus.NonRecoverableError;
+                    this.logger.Info(this.clientId, $"Had to exit current role (coordinator or follower) and auto-recovery is disabled. Exiting the current session context.");
+                    return ProcessStatus.NonRecoverableError;
                 }
             }
 
             if(this.zooKeeperService.GetKeeperState() == Watcher.Event.KeeperState.Expired)
-                return SessionStatus.Expired;
+                return ProcessStatus.ExpiredSession;
             
             if (token.IsCancellationRequested)
-                return SessionStatus.Cancelled;
+                return ProcessStatus.Cancelled;
             
-            return SessionStatus.NonRecoverableError;
+            return ProcessStatus.NonRecoverableError;
         }
 
-        private async Task<SessionStatus> RegisterClientZnode()
+        private async Task<ProcessStatus> RegisterClientZnode()
         {
-            this.logger.Info("Opening new session");
+            this.logger.Info(this.clientId, "Opening new session");
             // blocks until the session starts
-            await this.zooKeeperService.StartSessionAsync(this.sessionTimeout);
+            var connnnected = await this.zooKeeperService.StartSessionAsync(this.sessionTimeout, this.connectTimeout);
+            if (!connnnected)
+                return ProcessStatus.CouldNotEstablishSession;
             
-            this.logger.Info("Initializing zookeeper client paths");
+            this.logger.Info(this.clientId, "Initializing zookeeper client paths");
 
             var initialized = false;
             switch (this.rebalancingMode)
@@ -194,22 +251,22 @@ namespace Rebalanser.ZooKeeper
             if (!initialized)
             {
                 var msg =
-                    "Could not start a new rebalanser context due to failure to initialize the ZooKeeper client.";
-                this.logger.Error(msg);
-                return SessionStatus.NonRecoverableError;
+                    "Could not start a new rebalanser client due to failure to initialize the ZooKeeper client.";
+                this.logger.Error(this.clientId, msg);
+                return ProcessStatus.NonRecoverableError;
             }
             
             var createRes = await this.zooKeeperService.CreateClientAsync();
             if (createRes.Result == ZkResult.SessionExpired)
-                return SessionStatus.Expired;
+                return ProcessStatus.ExpiredSession;
             if (createRes.Result == ZkResult.NoZnode || createRes.Result == ZkResult.ConnectionLost)
-                return SessionStatus.CouldNotEstablishSession;
+                return ProcessStatus.CouldNotEstablishSession;
             
             this.clientPath = createRes.Data;
             this.SetIdFromPath();
-            this.logger.Info($"Client znode registered with Id {this.clientId}");
+            this.logger.Info(this.clientId, $"Client znode registered with Id {this.clientId}");
 
-            return SessionStatus.Valid;
+            return ProcessStatus.Valid;
         }
         
         private async Task<bool> BlockTillConnected(CancellationToken token)
@@ -225,10 +282,10 @@ namespace Rebalanser.ZooKeeper
             return true;
         }
 
-        private async Task<SessionStatus> RunAsCoordinatorAsync(OnChangeActions onChangeActions, 
+        private async Task<ProcessStatus> RunAsCoordinatorAsync(OnChangeActions onChangeActions, 
             CancellationToken token)
         {
-            this.logger.Info($"I am the smallest sibling and therefore the leader");
+            this.logger.Info(this.clientId, $"As client {this.clientId}, I am the smallest sibling and therefore the leader");
             ICoordinator coordinator;
             switch (this.rebalancingMode)
             {
@@ -256,36 +313,36 @@ namespace Rebalanser.ZooKeeper
             switch (hasBecome)
             {
                 case BecomeCoordinatorResult.Ok:
-                    this.logger.Info($"Have become the coordinator");
+                    this.logger.Info(this.clientId, $"Have become the coordinator");
                     // this blocks until coordinator terminates (due to failure, session expiry or detects it is a zombie)
                     var coordinatorExitReason = await coordinator.StartEventLoopAsync();
-                    this.logger.Info($"The coordinator has exited for reason {coordinatorExitReason}");
+                    this.logger.Info(this.clientId, $"The coordinator has exited for reason {coordinatorExitReason}");
                     if (coordinatorExitReason == CoordinatorExitReason.Cancelled)
-                        return SessionStatus.Cancelled;
+                        return ProcessStatus.Cancelled;
                     if (coordinatorExitReason == CoordinatorExitReason.SessionExpired)
-                        return SessionStatus.Expired;
+                        return ProcessStatus.ExpiredSession;
 
                     break;
                 case BecomeCoordinatorResult.StaleEpoch:
-                    this.logger.Info(
+                    this.logger.Info(this.clientId, 
                         "Since being elected, the epoch has been incremented suggesting another leader. Aborting coordinator role to check leadership again");
-                    break;
+                    return ProcessStatus.RoleChange;
                 default:
-                    this.logger.Error("Could not become coordinator");
+                    this.logger.Error(this.clientId, "Could not become coordinator");
                     break;
             }
 
             if (this.zooKeeperService.GetKeeperState() == Watcher.Event.KeeperState.Expired)
-                return SessionStatus.Expired;
+                return ProcessStatus.ExpiredSession;
             
-            return SessionStatus.Valid;
+            return ProcessStatus.ErrorWithValidSession;
         }
 
-        private async Task<SessionStatus> RunAsFollowerAsync(OnChangeActions onChangeActions, 
+        private async Task<ProcessStatus> RunAsFollowerAsync(OnChangeActions onChangeActions, 
             CancellationToken token,
             string siblingPath)
         {
-            this.logger.Info($"I am not the smallest sibling, becoming a follower");
+            this.logger.Info(this.clientId, $"I am not the smallest sibling, becoming a follower");
 
             IFollower follower;
             switch (this.rebalancingMode)
@@ -317,25 +374,25 @@ namespace Rebalanser.ZooKeeper
             var followerInitialized = await follower.BecomeFollowerAsync();
             if (followerInitialized)
             {
-                this.logger.Info($"Have become a follower, starting follower event loop");
+                this.logger.Info(this.clientId, $"Have become a follower, starting follower event loop");
                 // blocks until follower either fails, the session expires or the follower detects it might be the new leader
                 var followerExitReason = await follower.StartEventLoopAsync();
-                this.logger.Info($"The follower has exited for reason {followerExitReason}");
+                this.logger.Info(this.clientId, $"The follower has exited for reason {followerExitReason}");
                 switch (followerExitReason)
                 {
-                    case FollowerStatus.IsNewLeader: return SessionStatus.Valid;
-                    case FollowerStatus.SessionExpired: return SessionStatus.Expired; 
-                    case FollowerStatus.Cancelled: return SessionStatus.Cancelled;
+                    case FollowerStatus.IsNewLeader: return ProcessStatus.RoleChange;
+                    case FollowerStatus.SessionExpired: return ProcessStatus.ExpiredSession; 
+                    case FollowerStatus.Cancelled: return ProcessStatus.Cancelled;
                 }
             }
             else
             {
-                this.logger.Error("Could not become a follower");
+                this.logger.Error(this.clientId, "Could not become a follower");
                 if(this.zooKeeperService.GetKeeperState() == Watcher.Event.KeeperState.Expired)
-                    return SessionStatus.Expired;
+                    return ProcessStatus.ExpiredSession;
             }
 
-            return SessionStatus.Valid;
+            return ProcessStatus.ErrorWithValidSession;
         }
         
         private async Task WaitFor(TimeSpan waitPeriod, CancellationToken token)
@@ -387,7 +444,7 @@ namespace Rebalanser.ZooKeeper
 
         private async Task<string> GetSiblingToWatchAsync()
         {
-            var maxClientNumber = 0;
+            var maxClientNumber = -1;
             var watchChild = string.Empty;
             var clientsRes = await this.zooKeeperService.GetActiveClientsAsync();
             if (clientsRes.Result == ZkResult.Ok)
@@ -403,7 +460,7 @@ namespace Rebalanser.ZooKeeper
                     }
                 }
 
-                if (maxClientNumber == 0)
+                if (maxClientNumber == -1)
                     return string.Empty;
                 
                 return watchChild;
@@ -445,7 +502,7 @@ namespace Rebalanser.ZooKeeper
             }
             catch (Exception ex)
             {
-                this.logger.Error(ex.ToString());
+                this.logger.Error(this.clientId, ex.ToString());
             }
         }
 
@@ -458,7 +515,7 @@ namespace Rebalanser.ZooKeeper
             }
             catch (Exception ex)
             {
-                this.logger.Error(ex.ToString());
+                this.logger.Error(this.clientId, ex.ToString());
             }
         }
     }

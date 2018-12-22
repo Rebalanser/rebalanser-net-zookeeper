@@ -13,4 +13,10 @@
       <ProjectReference Include="..\Rebalanser.ZooKeeper\Rebalanser.ZooKeeper.csproj" />
     </ItemGroup>
 
+    <ItemGroup>
+      <Reference Include="Rebalanser.Core, Version=0.2.0.0, Culture=neutral, PublicKeyToken=null">
+        <HintPath>..\..\..\rebalanser-net\src\Rebalanser.Core\bin\Release\netstandard2.0\Rebalanser.Core.dll</HintPath>
+      </Reference>
+    </ItemGroup>
+
 </Project>

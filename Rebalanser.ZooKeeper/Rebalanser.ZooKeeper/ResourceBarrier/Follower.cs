@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -63,7 +64,7 @@ namespace Rebalanser.ZooKeeper.ResourceBarrier
             if (watchSiblingRes != ZkResult.Ok)
             {
                 if(watchSiblingRes == ZkResult.NoZnode)
-                    this.logger.Info($"Could not set a watch on sibling node {this.watchSiblingPath} as it no longer exists");
+                    this.logger.Info(this.clientId, $"Follower - Could not set a watch on sibling node {this.watchSiblingPath} as it no longer exists");
                 return false;
             }
 
@@ -96,7 +97,7 @@ namespace Rebalanser.ZooKeeper.ResourceBarrier
                         followerStatus = FollowerStatus.UnexpectedFailure;
                         break;
                     default:
-                        this.logger.Error($"Non-supported SiblingCheckResult {siblingResult}");
+                        this.logger.Error(this.clientId, $"Follower - Non-supported SiblingCheckResult {siblingResult}");
                         break;
                 }
             }
@@ -131,7 +132,7 @@ namespace Rebalanser.ZooKeeper.ResourceBarrier
                 if (this.statusChange)
                 {
                     await CancelRebalancingIfInProgressAsync();
-                    logger.Info("Rebalancing triggered");
+                    logger.Info(this.clientId, "Follower - Rebalancing triggered");
                     this.statusChange = false;
                     rebalancingTask = Task.Run(async () => await RespondToRebalancing(this.rebalancingCts.Token, 1));
                 }
@@ -141,6 +142,7 @@ namespace Rebalanser.ZooKeeper.ResourceBarrier
 
             if (this.followerToken.IsCancellationRequested)
             {
+                await CancelRebalancingIfInProgressAsync();
                 await this.zooKeeperService.CloseSessionAsync();
                 return FollowerStatus.Cancelled;
             }
@@ -156,13 +158,13 @@ namespace Rebalanser.ZooKeeper.ResourceBarrier
                 switch (result)
                 {
                     case RebalancingResult.Complete: 
-                        logger.Info("Rebalancing complete");
+                        logger.Info(this.clientId, "Follower - Rebalancing complete");
                         break;
                     case RebalancingResult.Cancelled:
-                        logger.Info("Rebalancing cancelled");
+                        logger.Info(this.clientId, "Follower - Rebalancing cancelled");
                         break;
                     case RebalancingResult.SessionExpired:
-                        logger.Info("Rebalancing aborted, lost session");
+                        logger.Info(this.clientId, "Follower - Rebalancing aborted, lost session");
                         this.followerStatus = FollowerStatus.SessionExpired;
                         break;
                     case RebalancingResult.Failure:
@@ -173,20 +175,20 @@ namespace Rebalanser.ZooKeeper.ResourceBarrier
                         }
                         else
                         {
-                            this.logger.Error($"Rebalancing failed. Will retry again with attempt {attempt}");
+                            this.logger.Error(this.clientId, $"Follower - Rebalancing failed. Will retry again with attempt {attempt}");
                             await RespondToRebalancing(rebalancingToken, attempt);
                         }
 
                         break;
                     default: 
-                        this.logger.Error($"A non-supported RebalancingResult has been returned: {result}");
+                        this.logger.Error(this.clientId, $"Follower - A non-supported RebalancingResult has been returned: {result}");
                         this.followerStatus = FollowerStatus.UnexpectedFailure;
                         break;
                 }
             }
             catch (Exception ex)
             {
-                this.logger.Error("An unexpected error has occurred, aborting rebalancing", ex);
+                this.logger.Error(this.clientId, "Follower - An unexpected error has occurred, aborting rebalancing", ex);
                 this.followerStatus = FollowerStatus.UnexpectedFailure;
             }
         }
@@ -205,6 +207,8 @@ namespace Rebalanser.ZooKeeper.ResourceBarrier
             }
             
             var currAssignmentRes = this.store.GetResources();
+            InvokeOnStopActions();
+            
             foreach (var resource in currAssignmentRes.Resources)
             {
                 var removeBarrierRes = await this.zooKeeperService.RemoveResourceBarrierAsync(resource);
@@ -233,7 +237,7 @@ namespace Rebalanser.ZooKeeper.ResourceBarrier
                 AssignmentStatus = AssignmentStatus.ResourcesAssigned, 
                 Resources = assignedResources
             });
-            InvokeOnStartActions();
+            InvokeOnStartActions(assignedResources);
             
             return RebalancingResult.Complete;
         }
@@ -262,7 +266,7 @@ namespace Rebalanser.ZooKeeper.ResourceBarrier
         {
             if (this.rebalancingTask != null && !this.rebalancingTask.IsCompleted)
             {
-                logger.Info("Cancelling the rebalancing that is in progress");
+                logger.Info(this.clientId, "Follower - Cancelling the rebalancing that is in progress");
                 this.rebalancingCts.Cancel();
                 await this.rebalancingTask; // might need to put a time limit on this
                 this.rebalancingCts = new CancellationTokenSource(); // reset cts
@@ -275,10 +279,10 @@ namespace Rebalanser.ZooKeeper.ResourceBarrier
                 onStopAction.Invoke();
         }
         
-        private void InvokeOnStartActions()
+        private void InvokeOnStartActions(List<string> assignedResources)
         {
             foreach(var onStartAction in this.onChangeActions.OnStartActions)
-                onStartAction.Invoke();
+                onStartAction.Invoke(assignedResources);
         }
         
         private async Task WaitFor(int milliseconds)
@@ -303,7 +307,7 @@ namespace Rebalanser.ZooKeeper.ResourceBarrier
 
         private async Task<SiblingCheckResult> CheckForSiblings()
         {
-            int maxClientNumber = 0;
+            int maxClientNumber = -1;
             string watchChild = string.Empty;
             var clientsRes = await this.zooKeeperService.GetActiveClientsAsync();
             if (clientsRes.Result != ZkResult.Ok)
@@ -320,7 +324,7 @@ namespace Rebalanser.ZooKeeper.ResourceBarrier
                 }
             }
 
-            if (maxClientNumber == 0)
+            if (maxClientNumber == -1)
                 return SiblingCheckResult.IsNewLeader;
             
             this.watchSiblingPath = watchChild;

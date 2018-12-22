@@ -28,42 +28,55 @@ namespace Rebalanser.ZooKeeper.Tests
             await this.zkHelper.InitializeAsync("localhost:2181", "/rebalanser", TimeSpan.FromSeconds(100));
             await this.zkHelper.PrepareResourceGroupAsync(groupName, "res", 5);
 
-            RegisterZookeeperProvider();
+            Providers.Register(GetProvider);
             var expectedAssignedResources = new List<string>() {"res0", "res1", "res2", "res3", "res4"};
-                
             
             // ACT
-            var actualAssignedResources = new List<string>();
-            var assigned = false;
-            using (var context = new RebalanserContext())
-            {
-                context.OnAssignment += (sender, args) =>
-                {
-                    actualAssignedResources = context.GetAssignedResources().ToList();
-                    assigned = true;
-                };
+            var (client, testEvents) = CreateClient();
+            await client.StartAsync(groupName, new ClientOptions() {AutoRecoveryOnError = false});
 
-                context.OnCancelAssignment += (sender, args) =>
-                {
-                    
-                };
-
-                context.OnError += (sender, args) =>
-                {
-                    
-                };
-
-                await context.StartAsync(groupName, new ContextOptions() { AutoRecoveryOnError = false });
-
-                var sw = new Stopwatch();
-                sw.Start();
-                while (!assigned && sw.Elapsed < TimeSpan.FromSeconds(30))
-                    await Task.Delay(100);
-            }
-
+            await Task.Delay(TimeSpan.FromSeconds(150));
+            
             // ASSERT
-            Assert.True(assigned, "Resources not assigned");
-            Assert.True(ResourcesMatch(expectedAssignedResources, actualAssignedResources), "Expected resources do not match actual resources assigned");
+            Assert.Equal(2, testEvents.Count);
+            Assert.Equal(EventType.Unassignment, testEvents[0].EventType);
+            Assert.Equal(EventType.Assignment, testEvents[1].EventType);
+            Assert.True(ResourcesMatch(expectedAssignedResources, testEvents[1].Resources.ToList()));
+            
+            await client.StopAsync(TimeSpan.FromSeconds(30));
+        }
+        
+        private (RebalanserClient, List<TestEvent> testEvents) CreateClient()
+        {
+            var client1 = new RebalanserClient();
+            var testEvents = new List<TestEvent>();
+            client1.OnAssignment += (sender, args) =>
+            {
+                testEvents.Add(new TestEvent()
+                {
+                    EventType = EventType.Assignment,
+                    Resources = args.Resources 
+                });
+            };
+
+            client1.OnUnassignment += (sender, args) =>
+            {
+                testEvents.Add(new TestEvent()
+                {
+                    EventType = EventType.Unassignment
+                });
+            };
+
+            client1.OnError += (sender, args) =>
+            {
+                testEvents.Add(new TestEvent()
+                {
+                    EventType = EventType.Error
+                });
+                Console.WriteLine($"OnError: {args.Exception.ToString()}");
+            };
+
+            return (client1, testEvents);
         }
 
         private bool ResourcesMatch(List<string> expectedRes, List<string> actualRes)
@@ -71,14 +84,14 @@ namespace Rebalanser.ZooKeeper.Tests
             return expectedRes.OrderBy(x => x).SequenceEqual(actualRes.OrderBy(x => x));
         }
 
-        private void RegisterZookeeperProvider()
+        private IRebalanserProvider GetProvider()
         {
-            var zkProvider = new ZooKeeperProvider("localhost:2181", 
+            return new ZooKeeperProvider("localhost:2181", 
                 "/rebalanser", 
-                TimeSpan.FromSeconds(100),
+                TimeSpan.FromSeconds(20),
+                TimeSpan.FromSeconds(20),
                 RebalancingMode.ResourceBarrier,
                 new ConsoleLogger());
-            Providers.Register(zkProvider);
         }
 
         public void Dispose()

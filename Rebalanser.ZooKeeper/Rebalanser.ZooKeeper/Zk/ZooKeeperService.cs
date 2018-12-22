@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Threading.Tasks;
 using Newtonsoft.Json;
@@ -19,11 +20,13 @@ namespace Rebalanser.ZooKeeper.Zk
         private string resourcesPath;
         private string epochPath;
         private Event.KeeperState keeperState;
+        private string clientId;
 
         public ZooKeeperService(string zookeeperHosts, ILogger logger)
         {
             this.zookeeperHosts = zookeeperHosts;
             this.logger = logger;
+            this.clientId = "Pending Id";
         }
         
         public async Task<bool> InitializeGlobalBarrierAsync(string clientsPath,
@@ -41,35 +44,35 @@ namespace Rebalanser.ZooKeeper.Zk
             var clientsPathRes = await EnsurePathAsync(this.clientsPath);
             if (clientsPathRes != ZkResult.Ok)
             {
-                this.logger.Error($"znode {this.clientsPath} does not exist and could not be created");
+                this.logger.Error(this.clientId, $"znode {this.clientsPath} does not exist and could not be created");
                 return false;
             }
             
             var epochPathRes = await EnsurePathAsync(this.epochPath);
             if (epochPathRes != ZkResult.Ok)
             {
-                this.logger.Error($"znode {this.epochPath} does not exist and could not be created");
+                this.logger.Error(this.clientId, $"znode {this.epochPath} does not exist and could not be created");
                 return false;
             }
             
             var statusPathRes = await EnsurePathAsync(this.statusPath);
             if (statusPathRes != ZkResult.Ok)
             {
-                this.logger.Error($"znode {this.statusPath} does not exist and could not be created");
+                this.logger.Error(this.clientId, $"znode {this.statusPath} does not exist and could not be created");
                 return false;
             }
             
             var stoppedPathRes = await EnsurePathAsync(this.stoppedPath);
             if (stoppedPathRes != ZkResult.Ok)
             {
-                this.logger.Error($"znode {this.stoppedPath} does not exist and could not be created");
+                this.logger.Error(this.clientId, $"znode {this.stoppedPath} does not exist and could not be created");
                 return false;
             }
             
             var resourcesPathRes = await EnsurePathAsync(this.resourcesPath);
             if (resourcesPathRes != ZkResult.Ok)
             {
-                this.logger.Error($"znode {this.resourcesPath} does not exist and could not be created");
+                this.logger.Error(this.clientId, $"znode {this.resourcesPath} does not exist and could not be created");
                 return false;
             }
 
@@ -87,21 +90,21 @@ namespace Rebalanser.ZooKeeper.Zk
             var clientsPathRes = await EnsurePathAsync(this.clientsPath);
             if (clientsPathRes != ZkResult.Ok)
             {
-                this.logger.Error($"znode {this.clientsPath} does not exist and could not be created");
+                this.logger.Error(this.clientId, $"znode {this.clientsPath} does not exist and could not be created");
                 return false;
             }
             
             var epochPathRes = await EnsurePathAsync(this.epochPath);
             if (epochPathRes != ZkResult.Ok)
             {
-                this.logger.Error($"znode {this.epochPath} does not exist and could not be created");
+                this.logger.Error(this.clientId, $"znode {this.epochPath} does not exist and could not be created");
                 return false;
             }
             
             var resourcesPathRes = await EnsurePathAsync(this.resourcesPath);
             if (resourcesPathRes != ZkResult.Ok)
             {
-                this.logger.Error($"znode {this.resourcesPath} does not exist and could not be created");
+                this.logger.Error(this.clientId, $"znode {this.resourcesPath} does not exist and could not be created");
                 return false;
             }
 
@@ -113,20 +116,23 @@ namespace Rebalanser.ZooKeeper.Zk
             return this.keeperState;
         }
 
-        public async Task StartSessionAsync(TimeSpan sessionTimeout)
+        public async Task<bool> StartSessionAsync(TimeSpan sessionTimeout, TimeSpan connectTimeout)
         {
+            var sw = new Stopwatch();
+            sw.Start();
+            
             if (this.zookeeper != null)
-            {
                 await this.zookeeper.closeAsync();
-            }
 
             this.zookeeper = new org.apache.zookeeper.ZooKeeper(
                 this.zookeeperHosts, 
                 (int)sessionTimeout.TotalMilliseconds,
                 this);
 
-            while (keeperState != Event.KeeperState.SyncConnected)
+            while (this.keeperState != Event.KeeperState.SyncConnected && sw.Elapsed <= connectTimeout)
                 await Task.Delay(50);
+
+            return this.keeperState == Event.KeeperState.SyncConnected;
         }
 
         public async Task CloseSessionAsync()
@@ -151,26 +157,28 @@ namespace Rebalanser.ZooKeeper.Zk
                     ZooDefs.Ids.OPEN_ACL_UNSAFE,
                     CreateMode.EPHEMERAL_SEQUENTIAL);
 
+                this.clientId = clientPath.Substring(clientPath.LastIndexOf("/")+1);
+
                 return new ZkResponse<string>(ZkResult.Ok, clientPath);
             }
             catch (KeeperException.NoNodeException e)
             {
-                this.logger.Error("Could not create client znode as parent node does not exist: " + e);
+                this.logger.Error(this.clientId, "Could not create client znode as parent node does not exist: " + e);
                 return new ZkResponse<string>(ZkResult.NoZnode);
             }
             catch (KeeperException.ConnectionLossException e)
             {
-                this.logger.Error("Could not create client znode as the connection has been lost: " + e);
+                this.logger.Error(this.clientId, "Could not create client znode as the connection has been lost: " + e);
                 return new ZkResponse<string>(ZkResult.ConnectionLost);
             }
             catch (KeeperException.SessionExpiredException e)
             {
-                this.logger.Error("Could not create client znode as the session has expired: " + e);
+                this.logger.Error(this.clientId, "Could not create client znode as the session has expired: " + e);
                 return new ZkResponse<string>(ZkResult.SessionExpired);
             }
             catch (Exception e)
             {
-                this.logger.Error("Could not create client znode: " + e);
+                this.logger.Error(this.clientId, "Could not create client znode: " + e);
                 return new ZkResponse<string>(ZkResult.UnexpectedError);
             }
         }
@@ -184,22 +192,22 @@ namespace Rebalanser.ZooKeeper.Zk
             }
             catch (KeeperException.NoNodeException e)
             {
-                this.logger.Error("Could not delete client znode as the node does not exist: " + e);
+                this.logger.Error(this.clientId, "Could not delete client znode as the node does not exist: " + e);
                 return ZkResult.NoZnode;
             }
             catch (KeeperException.ConnectionLossException e)
             {
-                this.logger.Error("Could not delete client znode as the connection has been lost: " + e);
+                this.logger.Error(this.clientId, "Could not delete client znode as the connection has been lost: " + e);
                 return ZkResult.ConnectionLost;
             }
             catch (KeeperException.SessionExpiredException e)
             {
-                this.logger.Error("Could not delete client znode as the session has expired: " + e);
+                this.logger.Error(this.clientId, "Could not delete client znode as the session has expired: " + e);
                 return ZkResult.SessionExpired;
             }
             catch (Exception e)
             {
-                this.logger.Error("Could not create client znode: " + e);
+                this.logger.Error(this.clientId, "Could not create client znode: " + e);
                 return ZkResult.UnexpectedError;
             }
         }
@@ -225,17 +233,17 @@ namespace Rebalanser.ZooKeeper.Zk
             }
             catch (KeeperException.ConnectionLossException e)
             {
-                this.logger.Error($"Could not create znode {znodePath} as the connection has been lost: " + e);
+                this.logger.Error(this.clientId, $"Could not create znode {znodePath} as the connection has been lost: " + e);
                 return ZkResult.ConnectionLost;
             }
             catch (KeeperException.SessionExpiredException e)
             {
-                this.logger.Error($"Could not create znode {znodePath} as the session has expired: " + e);
+                this.logger.Error(this.clientId, $"Could not create znode {znodePath} as the session has expired: " + e);
                 return ZkResult.SessionExpired;
             }
             catch (Exception e)
             {
-                this.logger.Error($"Could not create znode {znodePath}: " + e);
+                this.logger.Error(this.clientId, $"Could not create znode {znodePath}: " + e);
                 return ZkResult.UnexpectedError;
             }
             //
@@ -251,35 +259,58 @@ namespace Rebalanser.ZooKeeper.Zk
             }
             catch (KeeperException.BadVersionException e)
             {
-                this.logger.Error("Could not increment epoch as the current epoch was incremented already. Stale epoch: " + e);
+                this.logger.Error(this.clientId, "Could not increment epoch as the current epoch was incremented already. Stale epoch: " + e);
                 return new ZkResponse<int>(ZkResult.BadVersion);
             }
             catch (KeeperException.NoNodeException e)
             {
-                this.logger.Error("Could not increment epoch as the node does not exist: " + e);
+                this.logger.Error(this.clientId, "Could not increment epoch as the node does not exist: " + e);
                 return new ZkResponse<int>(ZkResult.NoZnode);
             }
             catch (KeeperException.ConnectionLossException e)
             {
-                this.logger.Error("Could not increment epoch as the connection has been lost: " + e);
+                this.logger.Error(this.clientId, "Could not increment epoch as the connection has been lost: " + e);
                 return new ZkResponse<int>(ZkResult.ConnectionLost);
             }
             catch (KeeperException.SessionExpiredException e)
             {
-                this.logger.Error("Could not increment epoch as the session has expired: " + e);
+                this.logger.Error(this.clientId, "Could not increment epoch as the session has expired: " + e);
                 return new ZkResponse<int>(ZkResult.SessionExpired);
             }
             catch (Exception e)
             {
-                this.logger.Error("Could not increment epoch: " + e);
+                this.logger.Error(this.clientId, "Could not increment epoch: " + e);
                 return new ZkResponse<int>(ZkResult.UnexpectedError);
             }
         }
         
         public async Task<ZkResponse<int>> GetEpochAsync()
         {
-            var dataResult = await zookeeper.getDataAsync(this.epochPath);
-            return new ZkResponse<int>(ZkResult.Ok, dataResult.Stat.getVersion());
+            try
+            {
+                var dataResult = await zookeeper.getDataAsync(this.epochPath);
+                return new ZkResponse<int>(ZkResult.Ok, dataResult.Stat.getVersion());
+            }
+            catch (KeeperException.NoNodeException e)
+            {
+                this.logger.Error(this.clientId, "Could not get the current epoch as the node does not exist: " + e);
+                return new ZkResponse<int>(ZkResult.NoZnode);
+            }
+            catch (KeeperException.ConnectionLossException e)
+            {
+                this.logger.Error(this.clientId, "Could not get the current epoch as the connection has been lost: " + e);
+                return new ZkResponse<int>(ZkResult.ConnectionLost);
+            }
+            catch (KeeperException.SessionExpiredException e)
+            {
+                this.logger.Error(this.clientId, "Could not get the current epoch as the session has expired: " + e);
+                return new ZkResponse<int>(ZkResult.SessionExpired);
+            }
+            catch (Exception e)
+            {
+                this.logger.Error(this.clientId, "Could not get the current epoch: " + e);
+                return new ZkResponse<int>(ZkResult.UnexpectedError);
+            }
         }
 
         public async Task<ZkResponse<ClientsZnode>> GetActiveClientsAsync()
@@ -296,22 +327,22 @@ namespace Rebalanser.ZooKeeper.Zk
             }
             catch (KeeperException.NoNodeException e)
             {
-                this.logger.Error("Could not get children as the node does not exist: " + e);
+                this.logger.Error(this.clientId, "Could not get children as the node does not exist: " + e);
                 return new ZkResponse<ClientsZnode>(ZkResult.NoZnode);
             }
             catch (KeeperException.ConnectionLossException e)
             {
-                this.logger.Error("Could not get children as the connection has been lost: " + e);
+                this.logger.Error(this.clientId, "Could not get children as the connection has been lost: " + e);
                 return new ZkResponse<ClientsZnode>(ZkResult.ConnectionLost);
             }
             catch (KeeperException.SessionExpiredException e)
             {
-                this.logger.Error("Could not get children epoch as the session has expired: " + e);
+                this.logger.Error(this.clientId, "Could not get children epoch as the session has expired: " + e);
                 return new ZkResponse<ClientsZnode>(ZkResult.SessionExpired);
             }
             catch (Exception e)
             {
-                this.logger.Error("Could not get children: " + e);
+                this.logger.Error(this.clientId, "Could not get children: " + e);
                 return new ZkResponse<ClientsZnode>(ZkResult.UnexpectedError);
             }
         }
@@ -333,22 +364,22 @@ namespace Rebalanser.ZooKeeper.Zk
             }
             catch (KeeperException.NoNodeException e)
             {
-                this.logger.Error("Could not get status as the node does not exist: " + e);
+                this.logger.Error(this.clientId, "Could not get status as the node does not exist: " + e);
                 return new ZkResponse<StatusZnode>(ZkResult.NoZnode);
             }
             catch (KeeperException.ConnectionLossException e)
             {
-                this.logger.Error("Could not get status as the connection has been lost: " + e);
+                this.logger.Error(this.clientId, "Could not get status as the connection has been lost: " + e);
                 return new ZkResponse<StatusZnode>(ZkResult.ConnectionLost);
             }
             catch (KeeperException.SessionExpiredException e)
             {
-                this.logger.Error("Could not get status epoch as the session has expired: " + e);
+                this.logger.Error(this.clientId, "Could not get status epoch as the session has expired: " + e);
                 return new ZkResponse<StatusZnode>(ZkResult.SessionExpired);
             }
             catch (Exception e)
             {
-                this.logger.Error("Could not get status: " + e);
+                this.logger.Error(this.clientId, "Could not get status: " + e);
                 return new ZkResponse<StatusZnode>(ZkResult.UnexpectedError);
             }
         }
@@ -363,27 +394,27 @@ namespace Rebalanser.ZooKeeper.Zk
             }
             catch (KeeperException.BadVersionException e)
             {
-                this.logger.Error("Could not set status due to a bad version number. " + e);
+                this.logger.Error(this.clientId, "Could not set status due to a bad version number. " + e);
                 return new ZkResponse<int>(ZkResult.BadVersion);
             }
             catch (KeeperException.NoNodeException e)
             {
-                this.logger.Error("Could not set status as the node does not exist: " + e);
+                this.logger.Error(this.clientId, "Could not set status as the node does not exist: " + e);
                 return new ZkResponse<int>(ZkResult.NoZnode);
             }
             catch (KeeperException.ConnectionLossException e)
             {
-                this.logger.Error("Could not set status as the connection has been lost: " + e);
+                this.logger.Error(this.clientId, "Could not set status as the connection has been lost: " + e);
                 return new ZkResponse<int>(ZkResult.ConnectionLost);
             }
             catch (KeeperException.SessionExpiredException e)
             {
-                this.logger.Error("Could not set status as the session has expired: " + e);
+                this.logger.Error(this.clientId, "Could not set status as the session has expired: " + e);
                 return new ZkResponse<int>(ZkResult.SessionExpired);
             }
             catch (Exception e)
             {
-                this.logger.Error("Could not set status: " + e);
+                this.logger.Error(this.clientId, "Could not set status: " + e);
                 return new ZkResponse<int>(ZkResult.UnexpectedError);
             }
         }
@@ -405,23 +436,23 @@ namespace Rebalanser.ZooKeeper.Zk
             }
             catch (KeeperException.NoNodeException e)
             {
-                this.logger.Error("Could not add follower to the stopped list as the stopped node does not exist: " +
+                this.logger.Error(this.clientId, "Could not add follower to the stopped list as the stopped node does not exist: " +
                                   e);
                 return ZkResult.NoZnode;
             }
             catch (KeeperException.ConnectionLossException e)
             {
-                this.logger.Error("Could not add follower to the stopped list as the connection has been lost: " + e);
+                this.logger.Error(this.clientId, "Could not add follower to the stopped list as the connection has been lost: " + e);
                 return ZkResult.ConnectionLost;
             }
             catch (KeeperException.SessionExpiredException e)
             {
-                this.logger.Error("Could not add follower to the stopped list as the session has expired: " + e);
+                this.logger.Error(this.clientId, "Could not add follower to the stopped list as the session has expired: " + e);
                 return ZkResult.SessionExpired;
             }
             catch (Exception e)
             {
-                this.logger.Error("Could not add follower to the stopped list: " + e);
+                this.logger.Error(this.clientId, "Could not add follower to the stopped list: " + e);
                 return ZkResult.UnexpectedError;
             }
         }
@@ -433,25 +464,23 @@ namespace Rebalanser.ZooKeeper.Zk
                 await this.zookeeper.deleteAsync($"{this.stoppedPath}/{clientId}");
                 return ZkResult.Ok;
             }
-            catch (KeeperException.NoNodeException e)
+            catch (KeeperException.NoNodeException)
             {
-                //this.logger.Error("Could not remove follower from the stopped list as the stopped node does not exist: " + e);
-                //return ZkResult.NoZnode;
                 return ZkResult.Ok;
             }
             catch (KeeperException.ConnectionLossException e)
             {
-                this.logger.Error("Could not remove follower from the stopped list as the connection has been lost: " + e);
+                this.logger.Error(this.clientId, "Could not remove follower from the stopped list as the connection has been lost: " + e);
                 return ZkResult.ConnectionLost;
             }
             catch (KeeperException.SessionExpiredException e)
             {
-                this.logger.Error("Could not remove follower from the stopped list as the session has expired: " + e);
+                this.logger.Error(this.clientId, "Could not remove follower from the stopped list as the session has expired: " + e);
                 return ZkResult.SessionExpired;
             }
             catch (Exception e)
             {
-                this.logger.Error("Could not remove follower from the stopped list: " + e);
+                this.logger.Error(this.clientId, "Could not remove follower from the stopped list: " + e);
                 return ZkResult.UnexpectedError;
             }
         }
@@ -477,22 +506,22 @@ namespace Rebalanser.ZooKeeper.Zk
             }
             catch (KeeperException.NoNodeException e)
             {
-                this.logger.Error("Could not get resources as the resources node does not exist: " + e);
+                this.logger.Error(this.clientId, "Could not get resources as the resources node does not exist: " + e);
                 return new ZkResponse<ResourcesZnode>(ZkResult.NoZnode);
             }
             catch (KeeperException.ConnectionLossException e)
             {
-                this.logger.Error("Could not get resources as the connection has been lost: " + e);
+                this.logger.Error(this.clientId, "Could not get resources as the connection has been lost: " + e);
                 return new ZkResponse<ResourcesZnode>(ZkResult.ConnectionLost);
             }
             catch (KeeperException.SessionExpiredException e)
             {
-                this.logger.Error("Could not get resources as the session has expired: " + e);
+                this.logger.Error(this.clientId, "Could not get resources as the session has expired: " + e);
                 return new ZkResponse<ResourcesZnode>(ZkResult.SessionExpired);
             }
             catch (Exception e)
             {
-                this.logger.Error("Could not get resources: " + e);
+                this.logger.Error(this.clientId, "Could not get resources: " + e);
                 return new ZkResponse<ResourcesZnode>(ZkResult.UnexpectedError);
             }
         }
@@ -508,27 +537,27 @@ namespace Rebalanser.ZooKeeper.Zk
             }
             catch (KeeperException.BadVersionException e)
             {
-                this.logger.Error("Could not set resource assignments due to a bad version number. " + e);
+                this.logger.Error(this.clientId, "Could not set resource assignments due to a bad version number. " + e);
                 return new ZkResponse<int>(ZkResult.BadVersion);
             }
             catch (KeeperException.NoNodeException e)
             {
-                this.logger.Error("Could not set resource assignments as the node does not exist: " + e);
+                this.logger.Error(this.clientId, "Could not set resource assignments as the node does not exist: " + e);
                 return new ZkResponse<int>(ZkResult.NoZnode);
             }
             catch (KeeperException.ConnectionLossException e)
             {
-                this.logger.Error("Could not set resource assignments as the connection has been lost: " + e);
+                this.logger.Error(this.clientId, "Could not set resource assignments as the connection has been lost: " + e);
                 return new ZkResponse<int>(ZkResult.ConnectionLost);
             }
             catch (KeeperException.SessionExpiredException e)
             {
-                this.logger.Error("Could not set resource assignments as the session has expired: " + e);
+                this.logger.Error(this.clientId, "Could not set resource assignments as the session has expired: " + e);
                 return new ZkResponse<int>(ZkResult.SessionExpired);
             }
             catch (Exception e)
             {
-                this.logger.Error("Could not set resource assignments: " + e);
+                this.logger.Error(this.clientId, "Could not set resource assignments: " + e);
                 return new ZkResponse<int>(ZkResult.UnexpectedError);
             }
         }
@@ -540,23 +569,23 @@ namespace Rebalanser.ZooKeeper.Zk
                 await this.zookeeper.deleteAsync($"{this.resourcesPath}/{resource}/barrier");
                 return ZkResult.Ok;
             }
-            catch (KeeperException.NoNodeException e)
+            catch (KeeperException.NoNodeException)
             {
                 return ZkResult.Ok;
             }
             catch (KeeperException.ConnectionLossException e)
             {
-                this.logger.Error("Could not remove barrier from the resource as the connection has been lost: " + e);
+                this.logger.Error(this.clientId, "Could not remove barrier from the resource as the connection has been lost: " + e);
                 return ZkResult.ConnectionLost;
             }
             catch (KeeperException.SessionExpiredException e)
             {
-                this.logger.Error("Could not remove barrier from the resource as the session has expired: " + e);
+                this.logger.Error(this.clientId, "Could not remove barrier from the resource as the session has expired: " + e);
                 return ZkResult.SessionExpired;
             }
             catch (Exception e)
             {
-                this.logger.Error("Could not remove barrier from the resource: " + e);
+                this.logger.Error(this.clientId, "Could not remove barrier from the resource: " + e);
                 return ZkResult.UnexpectedError;
             }
         }
@@ -578,23 +607,23 @@ namespace Rebalanser.ZooKeeper.Zk
             }
             catch (KeeperException.NoNodeException e)
             {
-                this.logger.Error("Could not add a barrier to the resource as the resources node does not exist: " +
+                this.logger.Error(this.clientId, "Could not add a barrier to the resource as the resources node does not exist: " +
                                   e);
                 return ZkResult.NoZnode;
             }
             catch (KeeperException.ConnectionLossException e)
             {
-                this.logger.Error("Could not add a barrier to the resource as the connection has been lost: " + e);
+                this.logger.Error(this.clientId, "Could not add a barrier to the resource as the connection has been lost: " + e);
                 return ZkResult.ConnectionLost;
             }
             catch (KeeperException.SessionExpiredException e)
             {
-                this.logger.Error("Could not add a barrier to the resource as the session has expired: " + e);
+                this.logger.Error(this.clientId, "Could not add a barrier to the resource as the session has expired: " + e);
                 return ZkResult.SessionExpired;
             }
             catch (Exception e)
             {
-                this.logger.Error("Could not add a barrier to the resource: " + e);
+                this.logger.Error(this.clientId, "Could not add a barrier to the resource: " + e);
                 return ZkResult.UnexpectedError;
             }
         }
@@ -608,22 +637,22 @@ namespace Rebalanser.ZooKeeper.Zk
             }
             catch (KeeperException.NoNodeException e)
             {
-                this.logger.Error("Could not get stopped clients as the stopped node does not exist: " + e);
+                this.logger.Error(this.clientId, "Could not get stopped clients as the stopped node does not exist: " + e);
                 return new ZkResponse<List<string>>(ZkResult.NoZnode);
             }
             catch (KeeperException.ConnectionLossException e)
             {
-                this.logger.Error("Could not get stopped clients as the connection has been lost: " + e);
+                this.logger.Error(this.clientId, "Could not get stopped clients as the connection has been lost: " + e);
                 return new ZkResponse<List<string>>(ZkResult.ConnectionLost);
             }
             catch (KeeperException.SessionExpiredException e)
             {
-                this.logger.Error("Could not get stopped clients as the session has expired: " + e);
+                this.logger.Error(this.clientId, "Could not get stopped clients as the session has expired: " + e);
                 return new ZkResponse<List<string>>(ZkResult.SessionExpired);
             }
             catch (Exception e)
             {
-                this.logger.Error("Could not get stopped clients: " + e);
+                this.logger.Error(this.clientId, "Could not get stopped clients: " + e);
                 return new ZkResponse<List<string>>(ZkResult.UnexpectedError);
             }
         }
@@ -637,22 +666,22 @@ namespace Rebalanser.ZooKeeper.Zk
             }
             catch (KeeperException.NoNodeException e)
             {
-                this.logger.Error("Could not set a watch on epoch as the epoch znode does not exist: " + e);
+                this.logger.Error(this.clientId, "Could not set a watch on epoch as the epoch znode does not exist: " + e);
                 return new ZkResponse<int>(ZkResult.NoZnode);
             }
             catch (KeeperException.ConnectionLossException e)
             {
-                this.logger.Error("Could not set a watch on epoch as the connection has been lost: " + e);
+                this.logger.Error(this.clientId, "Could not set a watch on epoch as the connection has been lost: " + e);
                 return new ZkResponse<int>(ZkResult.ConnectionLost);
             }
             catch (KeeperException.SessionExpiredException e)
             {
-                this.logger.Error("Could not set a watch on epoch as the session has expired: " + e);
+                this.logger.Error(this.clientId, "Could not set a watch on epoch as the session has expired: " + e);
                 return new ZkResponse<int>(ZkResult.SessionExpired);
             }
             catch (Exception e)
             {
-                this.logger.Error("Could not set a watch on epoch: " + e);
+                this.logger.Error(this.clientId, "Could not set a watch on epoch: " + e);
                 return new ZkResponse<int>(ZkResult.UnexpectedError);
             }
         }
@@ -670,22 +699,22 @@ namespace Rebalanser.ZooKeeper.Zk
             }
             catch (KeeperException.NoNodeException e)
             {
-                this.logger.Error("Could not set a watch on status as the status znode does not exist: " + e);
+                this.logger.Error(this.clientId, "Could not set a watch on status as the status znode does not exist: " + e);
                 return new ZkResponse<StatusZnode>(ZkResult.NoZnode);
             }
             catch (KeeperException.ConnectionLossException e)
             {
-                this.logger.Error("Could not set a watch on status as the connection has been lost: " + e);
+                this.logger.Error(this.clientId, "Could not set a watch on status as the connection has been lost: " + e);
                 return new ZkResponse<StatusZnode>(ZkResult.ConnectionLost);
             }
             catch (KeeperException.SessionExpiredException e)
             {
-                this.logger.Error("Could not set a watch on status as the session has expired: " + e);
+                this.logger.Error(this.clientId, "Could not set a watch on status as the session has expired: " + e);
                 return new ZkResponse<StatusZnode>(ZkResult.SessionExpired);
             }
             catch (Exception e)
             {
-                this.logger.Error("Could not set a watch on status: " + e);
+                this.logger.Error(this.clientId, "Could not set a watch on status: " + e);
                 return new ZkResponse<StatusZnode>(ZkResult.UnexpectedError);
             }
         }
@@ -699,22 +728,22 @@ namespace Rebalanser.ZooKeeper.Zk
             }
             catch (KeeperException.NoNodeException e)
             {
-                this.logger.Error("Could not set a watch on resources children as the resources znode does not exist: " + e);
+                this.logger.Error(this.clientId, "Could not set a watch on resources children as the resources znode does not exist: " + e);
                 return ZkResult.NoZnode;
             }
             catch (KeeperException.ConnectionLossException e)
             {
-                this.logger.Error("Could not set a watch on resources as the connection has been lost: " + e);
+                this.logger.Error(this.clientId, "Could not set a watch on resources as the connection has been lost: " + e);
                 return ZkResult.ConnectionLost;
             }
             catch (KeeperException.SessionExpiredException e)
             {
-                this.logger.Error("Could not set a watch on resources as the session has expired: " + e);
+                this.logger.Error(this.clientId, "Could not set a watch on resources as the session has expired: " + e);
                 return ZkResult.SessionExpired;
             }
             catch (Exception e)
             {
-                this.logger.Error("Could not set a watch on resources: " + e);
+                this.logger.Error(this.clientId, "Could not set a watch on resources: " + e);
                 return ZkResult.UnexpectedError;
             }
         }
@@ -728,22 +757,22 @@ namespace Rebalanser.ZooKeeper.Zk
             }
             catch (KeeperException.NoNodeException e)
             {
-                this.logger.Error("Could not set a data watch on resource znode as the resources znode does not exist: " + e);
+                this.logger.Error(this.clientId, "Could not set a data watch on resource znode as the resources znode does not exist: " + e);
                 return ZkResult.NoZnode;
             }
             catch (KeeperException.ConnectionLossException e)
             {
-                this.logger.Error("Could not set a data watch on resource znode as the connection has been lost: " + e);
+                this.logger.Error(this.clientId, "Could not set a data watch on resource znode as the connection has been lost: " + e);
                 return ZkResult.ConnectionLost;
             }
             catch (KeeperException.SessionExpiredException e)
             {
-                this.logger.Error("Could not set a data watch on resource znode as the session has expired: " + e);
+                this.logger.Error(this.clientId, "Could not set a data watch on resource znode as the session has expired: " + e);
                 return ZkResult.SessionExpired;
             }
             catch (Exception e)
             {
-                this.logger.Error("Could not set a data watch on resource znode: " + e);
+                this.logger.Error(this.clientId, "Could not set a data watch on resource znode: " + e);
                 return ZkResult.UnexpectedError;
             }
         }
@@ -757,22 +786,22 @@ namespace Rebalanser.ZooKeeper.Zk
             }
             catch (KeeperException.NoNodeException e)
             {
-                this.logger.Error("Could not set a watch on clients as the clients znode does not exist: " + e);
+                this.logger.Error(this.clientId, "Could not set a watch on clients as the clients znode does not exist: " + e);
                 return ZkResult.NoZnode;
             }
             catch (KeeperException.ConnectionLossException e)
             {
-                this.logger.Error("Could not set a watch on clients as the connection has been lost: " + e);
+                this.logger.Error(this.clientId, "Could not set a watch on clients as the connection has been lost: " + e);
                 return ZkResult.ConnectionLost;
             }
             catch (KeeperException.SessionExpiredException e)
             {
-                this.logger.Error("Could not set a watch on clients as the session has expired: " + e);
+                this.logger.Error(this.clientId, "Could not set a watch on clients as the session has expired: " + e);
                 return ZkResult.SessionExpired;
             }
             catch (Exception e)
             {
-                this.logger.Error("Could not set a watch on clients: " + e);
+                this.logger.Error(this.clientId, "Could not set a watch on clients: " + e);
                 return ZkResult.UnexpectedError;
             }
         }
@@ -786,22 +815,22 @@ namespace Rebalanser.ZooKeeper.Zk
             }
             catch (KeeperException.NoNodeException e)
             {
-                this.logger.Error("Could not set a watch on a sibling client as the node does not exist: " + e);
+                this.logger.Error(this.clientId, "Could not set a watch on a sibling client as the node does not exist: " + e);
                 return ZkResult.NoZnode;
             }
             catch (KeeperException.ConnectionLossException e)
             {
-                this.logger.Error("Could not set a watch on a sibling client as the connection has been lost: " + e);
+                this.logger.Error(this.clientId, "Could not set a watch on a sibling client as the connection has been lost: " + e);
                 return ZkResult.ConnectionLost;
             }
             catch (KeeperException.SessionExpiredException e)
             {
-                this.logger.Error("Could not set a watch on a sibling client as the session has expired: " + e);
+                this.logger.Error(this.clientId, "Could not set a watch on a sibling client as the session has expired: " + e);
                 return ZkResult.SessionExpired;
             }
             catch (Exception e)
             {
-                this.logger.Error("Could not set a watch on a sibling client: " + e);
+                this.logger.Error(this.clientId, "Could not set a watch on a sibling client: " + e);
                 return ZkResult.UnexpectedError;
             }
         }

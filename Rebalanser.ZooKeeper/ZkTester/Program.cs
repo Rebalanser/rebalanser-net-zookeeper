@@ -108,27 +108,22 @@ namespace ZkTester
         private async Task StartClientAsync(string id, CancellationToken token)
         {
             Console.WriteLine($"{id}: Starting");
-            var zkProvider = new ZooKeeperProvider("localhost:2181", 
-                "/rebalanser", 
-                TimeSpan.FromMinutes(5),
-                RebalancingMode.ResourceBarrier,
-                new ConsoleLogger());
-            Providers.Register(zkProvider);
+            
+            Providers.Register(GetProvider);
             Random r = new Random(Guid.NewGuid().GetHashCode());
             
-            using (var context = new RebalanserContext())
+            using (var context = new RebalanserClient())
             {
                 context.OnAssignment += (sender, args) =>
                 {
                     Thread.Sleep(r.Next(5000));
-                    var resources = context.GetAssignedResources();
-                    if(resources.Any())
-                        Console.WriteLine($"{id}: Resources Assigned: {string.Join(",", resources)}");
+                    if(args.Resources.Any())
+                        Console.WriteLine($"{id}: Resources Assigned: {string.Join(",", args.Resources)}");
                     else
                         Console.WriteLine($"{id}: No resources Assigned");
                 };
 
-                context.OnCancelAssignment += (sender, args) =>
+                context.OnUnassignment += (sender, args) =>
                 {
                     Thread.Sleep(r.Next(5000));
                     Console.WriteLine($"{id}: Consumer subscription cancelled");
@@ -139,7 +134,7 @@ namespace ZkTester
                     Console.WriteLine($"{id}: Error: {args.Message}, automatic recovery set to: {args.AutoRecoveryEnabled}, Exception: {args.Exception.Message}");
                 };
 
-                await context.StartAsync("mygroup", new ContextOptions() { AutoRecoveryOnError = true, RestartDelay = TimeSpan.FromSeconds(30) });
+                await context.StartAsync("mygroup", new ClientOptions() { AutoRecoveryOnError = true, RestartDelay = TimeSpan.FromSeconds(30) });
 
                 Console.WriteLine($"{id}: Started");
                 while (!token.IsCancellationRequested)
@@ -147,6 +142,16 @@ namespace ZkTester
 
                 Console.WriteLine($"{id}: Cancelled");
             }
+        }
+
+        private IRebalanserProvider GetProvider()
+        {
+            return new ZooKeeperProvider("localhost:2181", 
+                "/rebalanser", 
+                TimeSpan.FromSeconds(20),
+                TimeSpan.FromSeconds(20),
+                RebalancingMode.ResourceBarrier,
+                new ConsoleLogger());
         }
     }
 }

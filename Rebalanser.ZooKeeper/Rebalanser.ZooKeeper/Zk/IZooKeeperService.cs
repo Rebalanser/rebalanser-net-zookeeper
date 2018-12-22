@@ -8,7 +8,7 @@ namespace Rebalanser.ZooKeeper.Zk
     public interface IZooKeeperService
     {
         Watcher.Event.KeeperState GetKeeperState();
-        Task StartSessionAsync(TimeSpan sessionTimeout);
+        Task<bool> StartSessionAsync(TimeSpan sessionTimeout, TimeSpan connectTimeout);
         Task CloseSessionAsync();
         Task<bool> InitializeGlobalBarrierAsync(string clientsPath,
             string statusPath,
