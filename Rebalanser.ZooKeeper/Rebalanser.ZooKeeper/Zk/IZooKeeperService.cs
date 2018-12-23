@@ -36,7 +36,7 @@ namespace Rebalanser.ZooKeeper.Zk
         Task<ZkResponse<int>> WatchEpochAsync(Watcher watcher);
         Task<ZkResponse<StatusZnode>> WatchStatusAsync(Watcher watcher);
         Task<ZkResult> WatchResourcesChildrenAsync(Watcher watcher);
-        Task<ZkResult> WatchResourcesDataAsync(Watcher watcher);
+        Task<ZkResponse<int>> WatchResourcesDataAsync(Watcher watcher);
         Task<ZkResult> WatchNodesAsync(Watcher watcher);
         Task<ZkResult> WatchSiblingNodeAsync(string siblingPath, Watcher watcher);
     }

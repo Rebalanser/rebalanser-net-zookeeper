@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.Threading.Tasks;
 using org.apache.zookeeper;
 
@@ -45,6 +46,20 @@ namespace Rebalanser.ZooKeeper.Tests.Helpers
             {
                 await zookeeper.deleteAsync($"{zkRootPath}/{group}/resources/{resourcePrefix}{i}");
             }
+        }
+        
+        public async Task AddResourceAsync(string group, string resourceName)
+        {
+            await CreateZnodeAsync($"{zkRootPath}/{group}/resources/{resourceName}");
+        }
+        
+        public async Task DeleteResourceAsync(string group, string resourceName)
+        {
+            var childrenRes = await zookeeper.getChildrenAsync($"{zkRootPath}/{group}/resources/{resourceName}");
+            foreach(var child in childrenRes.Children)
+                await zookeeper.deleteAsync($"{zkRootPath}/{group}/resources/{resourceName}/{child}");
+                
+            await zookeeper.deleteAsync($"{zkRootPath}/{group}/resources/{resourceName}");
         }
 
         public override async Task process(WatchedEvent @event)

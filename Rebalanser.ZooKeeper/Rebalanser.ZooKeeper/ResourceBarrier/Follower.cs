@@ -27,6 +27,7 @@ namespace Rebalanser.ZooKeeper.ResourceBarrier
         private string siblingId;
         private Task rebalancingTask;
         private CancellationTokenSource rebalancingCts;
+        private int resourcesVersion;
         
 
         private enum SiblingCheckResult
@@ -67,52 +68,59 @@ namespace Rebalanser.ZooKeeper.ResourceBarrier
                     this.logger.Info(this.clientId, $"Follower - Could not set a watch on sibling node {this.watchSiblingPath} as it no longer exists");
                 return false;
             }
+            
+            this.logger.Info(this.clientId, $"Follower - Set a watch on sibling node {this.watchSiblingPath}");
 
             var watchStatusRes = await this.zooKeeperService.WatchResourcesDataAsync(this);
-            if (watchStatusRes != ZkResult.Ok)
+            if (watchStatusRes.Result != ZkResult.Ok)
+            {
+                this.logger.Info(this.clientId, $"Follower - Could not set a watch on resources node");
                 return false;
+            }
+            
+            this.logger.Info(this.clientId, $"Follower - Set a watch on resources node");
+
+            this.resourcesVersion = watchStatusRes.Data;
             
             return true;
         }
         
         public override async Task process(WatchedEvent @event)
         {
-            if (@event.getState() == Event.KeeperState.Expired)
+            switch (@event.getState())
             {
-                this.followerStatus = FollowerStatus.SessionExpired;
-            }
-            // if the sibling client has been removed then this client must either be the new leader
-            // or the node needs to monitor the next smallest client
-            else if (@event.getPath().EndsWith(this.siblingId))
-            {
-                var siblingResult = await CheckForSiblings();
-                switch (siblingResult)
-                {
-                    case SiblingCheckResult.WatchingNewSibling:
-                        break;
-                    case SiblingCheckResult.IsNewLeader:
-                        followerStatus = FollowerStatus.IsNewLeader;
-                        break;
-                    case SiblingCheckResult.Error:
-                        followerStatus = FollowerStatus.UnexpectedFailure;
-                        break;
-                    default:
-                        this.logger.Error(this.clientId, $"Follower - Non-supported SiblingCheckResult {siblingResult}");
-                        break;
-                }
-            }
-            // status change
-            else if (@event.getPath().EndsWith("resources"))
-            {
-                var watchStatusRes = await this.zooKeeperService.WatchResourcesDataAsync(this);
-                if (watchStatusRes != ZkResult.Ok)
+                case Event.KeeperState.Expired:
+                    this.followerStatus = FollowerStatus.SessionExpired;
+                    break;
+                case Event.KeeperState.Disconnected:
+                    break;
+                case Event.KeeperState.SyncConnected:
+                case Event.KeeperState.ConnectedReadOnly:
+                    if (@event.getPath() != null)
+                    {
+                        if (@event.getPath().EndsWith(this.siblingId))
+                        {
+                            await PerformLeaderCheck();
+                        }
+                        // status change
+                        else if (@event.getPath().EndsWith("resources"))
+                        {
+                            var watchStatusRes = await this.zooKeeperService.WatchResourcesDataAsync(this);
+                            if (watchStatusRes.Result != ZkResult.Ok)
+                                this.followerStatus = FollowerStatus.UnexpectedFailure;
+                            else
+                            {
+                                this.statusChange = true;
+                                this.resourcesVersion = watchStatusRes.Data;
+                            }
+                        }
+                    }
+                    break;
+                default:
                     this.followerStatus = FollowerStatus.UnexpectedFailure;
-                else
-                    statusChange = true;
-            }
-            else
-            {
-                // log it 
+                    this.logger.Error(this.clientId,
+                        $"Follower - Currently this library does not support ZooKeeper state {@event.getState()}");
+                    break;
             }
 
             await Task.Yield();
@@ -305,6 +313,26 @@ namespace Rebalanser.ZooKeeper.ResourceBarrier
             {}
         }
 
+        private async Task PerformLeaderCheck()
+        {
+            var siblingResult = await CheckForSiblings();
+            switch (siblingResult)
+            {
+                case SiblingCheckResult.WatchingNewSibling:
+                    break;
+                case SiblingCheckResult.IsNewLeader:
+                    this.followerStatus = FollowerStatus.IsNewLeader;
+                    break;
+                case SiblingCheckResult.Error:
+                    this.followerStatus = FollowerStatus.UnexpectedFailure;
+                    break;
+                default:
+                    this.logger.Error(this.clientId,
+                        $"Follower - Non-supported SiblingCheckResult {siblingResult}");
+                    break;
+            }
+        }
+        
         private async Task<SiblingCheckResult> CheckForSiblings()
         {
             int maxClientNumber = -1;
@@ -331,8 +359,13 @@ namespace Rebalanser.ZooKeeper.ResourceBarrier
             this.siblingId = watchSiblingPath.Substring(watchChild.LastIndexOf("/", StringComparison.Ordinal));
             var newWatchRes = await this.zooKeeperService.WatchSiblingNodeAsync(watchChild, this);
             if (newWatchRes != ZkResult.Ok)
+            {
+                this.logger.Info(this.clientId, $"Follower - Could not set a watch on sibling node {this.watchSiblingPath} as it no longer exists");
                 return SiblingCheckResult.Error;
+            }
             
+            this.logger.Info(this.clientId, $"Follower - Set a watch on sibling node {this.watchSiblingPath}");
+
             return SiblingCheckResult.WatchingNewSibling;
         }
     }

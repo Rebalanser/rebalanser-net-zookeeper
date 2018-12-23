@@ -748,32 +748,32 @@ namespace Rebalanser.ZooKeeper.Zk
             }
         }
 
-        public async Task<ZkResult> WatchResourcesDataAsync(Watcher watcher)
+        public async Task<ZkResponse<int>> WatchResourcesDataAsync(Watcher watcher)
         {
             try
             {
-                await this.zookeeper.getDataAsync(this.resourcesPath, watcher);
-                return ZkResult.Ok;
+                var data = await this.zookeeper.getDataAsync(this.resourcesPath, watcher);
+                return new ZkResponse<int>(ZkResult.Ok, data.Stat.getVersion());
             }
             catch (KeeperException.NoNodeException e)
             {
                 this.logger.Error(this.clientId, "Could not set a data watch on resource znode as the resources znode does not exist: " + e);
-                return ZkResult.NoZnode;
+                return new ZkResponse<int>(ZkResult.NoZnode);
             }
             catch (KeeperException.ConnectionLossException e)
             {
                 this.logger.Error(this.clientId, "Could not set a data watch on resource znode as the connection has been lost: " + e);
-                return ZkResult.ConnectionLost;
+                return new ZkResponse<int>(ZkResult.ConnectionLost);
             }
             catch (KeeperException.SessionExpiredException e)
             {
                 this.logger.Error(this.clientId, "Could not set a data watch on resource znode as the session has expired: " + e);
-                return ZkResult.SessionExpired;
+                return new ZkResponse<int>(ZkResult.SessionExpired);
             }
             catch (Exception e)
             {
                 this.logger.Error(this.clientId, "Could not set a data watch on resource znode: " + e);
-                return ZkResult.UnexpectedError;
+                return new ZkResponse<int>(ZkResult.UnexpectedError);
             }
         }
         
