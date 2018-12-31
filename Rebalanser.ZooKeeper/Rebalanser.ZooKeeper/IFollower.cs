@@ -1,10 +1,11 @@
 using System.Threading.Tasks;
+using Rebalanser.ZooKeeper.Zk;
 
 namespace Rebalanser.ZooKeeper
 {
     public interface IFollower
     {
-        Task<bool> BecomeFollowerAsync();
-        Task<FollowerStatus> StartEventLoopAsync();
+        Task<BecomeFollowerResult> BecomeFollowerAsync();
+        Task<FollowerExitReason> StartEventLoopAsync();
     }
 }

@@ -2,11 +2,10 @@ namespace Rebalanser.ZooKeeper
 {
     public enum CoordinatorExitReason
     {
-        NoExit,
-        NotCoordinator,
+        NoLongerCoordinator,
         Cancelled,
         SessionExpired,
-        RebalancingError,
-        Unknown
+        PotentialInconsistentState,
+        FatalError
     }
 }

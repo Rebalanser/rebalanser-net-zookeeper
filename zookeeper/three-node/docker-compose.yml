@@ -1,0 +1,54 @@
+version: '3'
+
+services:
+  zk1:
+    image: zookeeper:3.4.9
+    hostname: zk1
+    ports:
+      - "2181:2181"
+      - "2888:2888"
+      - "3888:3888"
+    environment:
+        ZOO_MY_ID: 1
+        ZOO_PORT: 2181
+        ZOO_SERVERS: server.1=0.0.0.0:2888:3888 server.2=zk2:2889:3889 server.3=zk3:2890:3890
+  zk2:
+    image: zookeeper:3.4.9
+    hostname: zk2
+    ports:
+      - "2182:2182"
+      - "2889:2889"
+      - "3889:3889"
+    environment:
+        ZOO_MY_ID: 2
+        ZOO_PORT: 2182
+        ZOO_SERVERS: server.1=zk1:2888:3888 server.2=0.0.0.0:2889:3889 server.3=zk3:2890:3890
+  zk3:
+    image: zookeeper:3.4.9
+    hostname: zk3
+    ports:
+      - "2183:2183"
+      - "2890:2890"
+      - "3890:3890"
+    environment:
+        ZOO_MY_ID: 3
+        ZOO_PORT: 2183
+        ZOO_SERVERS: server.1=zk1:2888:3888 server.2=zk2:2889:3889 server.3=0.0.0.0:2890:3890
+  web:
+      image: elkozmon/zoonavigator-web:0.5.0
+      container_name: zoonavigator-web
+      ports:
+      - "8000:8000"
+      environment:
+        WEB_HTTP_PORT: 8000
+        API_HOST: "api"
+        API_PORT: 9000
+      depends_on:
+      - api
+      restart: always
+  api:
+    image: elkozmon/zoonavigator-api:0.5.0
+    container_name: zoonavigator-api
+    environment:
+      API_HTTP_PORT: 9000
+    restart: always

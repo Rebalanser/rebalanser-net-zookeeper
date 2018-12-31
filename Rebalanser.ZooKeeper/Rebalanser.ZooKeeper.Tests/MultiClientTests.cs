@@ -24,7 +24,7 @@ namespace Rebalanser.ZooKeeper.Tests
         {
             // ARRANGE
             var groupName = Guid.NewGuid().ToString();
-            await this.zkHelper.InitializeAsync("localhost:2181", "/rebalanser", TimeSpan.FromSeconds(20));
+            await this.zkHelper.InitializeAsync("/rebalanser", TimeSpan.FromSeconds(20), TimeSpan.FromSeconds(30));
             await this.zkHelper.PrepareResourceGroupAsync(groupName, "res", 6);
 
             Providers.Register(GetProvider);
@@ -56,7 +56,7 @@ namespace Rebalanser.ZooKeeper.Tests
         {
             // ARRANGE
             var groupName = Guid.NewGuid().ToString();
-            await this.zkHelper.InitializeAsync("localhost:2181", "/rebalanser", TimeSpan.FromSeconds(20));
+            await this.zkHelper.InitializeAsync("/rebalanser", TimeSpan.FromSeconds(20), TimeSpan.FromSeconds(30));
             await this.zkHelper.PrepareResourceGroupAsync(groupName, "res", 6);
 
             Providers.Register(GetProvider);
@@ -85,8 +85,8 @@ namespace Rebalanser.ZooKeeper.Tests
             // ASSERT - stopped client has had resources unassigned and remaining two
             // have been equally assigned the 6 resources between them
             AssertUnassignedOnly(testEvents1);
-            AssertAssigned(testEvents2, 3);
-            AssertAssigned(testEvents3, 3);
+            AssertUnassignedThenAssigned(testEvents2, 3);
+            AssertUnassignedThenAssigned(testEvents3, 3);
             
             // ACT - stop one client
             await client2.StopAsync();
@@ -97,7 +97,7 @@ namespace Rebalanser.ZooKeeper.Tests
             // have been assigned all 6 resources between them
             AssertNoEvents(testEvents1);
             AssertUnassignedOnly(testEvents2);
-            AssertAssigned(testEvents3, 6);
+            AssertUnassignedThenAssigned(testEvents3, 6);
             
             // clean up
             await client3.StopAsync();
@@ -108,7 +108,7 @@ namespace Rebalanser.ZooKeeper.Tests
         {
             // ARRANGE
             var groupName = Guid.NewGuid().ToString();
-            await this.zkHelper.InitializeAsync("localhost:2181", "/rebalanser", TimeSpan.FromSeconds(20));
+            await this.zkHelper.InitializeAsync("/rebalanser", TimeSpan.FromSeconds(20), TimeSpan.FromSeconds(30));
             await this.zkHelper.PrepareResourceGroupAsync(groupName, "res", 6);
 
             Providers.Register(GetProvider);
@@ -135,7 +135,7 @@ namespace Rebalanser.ZooKeeper.Tests
             
             // ASSERT - client 1 and 2 that have started have been equally assigned resources
             // but that client 3 that has not started has been assigned nothing
-            AssertAssigned(testEvents1, 3);
+            AssertUnassignedThenAssigned(testEvents1, 3);
             AssertAssigned(testEvents2, 3);
             AssertNoEvents(testEvents3);
             
@@ -145,8 +145,8 @@ namespace Rebalanser.ZooKeeper.Tests
             await Task.Delay(TimeSpan.FromSeconds(15));
             
             // ASSERT - all clients have been equally assigned the resources
-            AssertAssigned(testEvents1, 2);
-            AssertAssigned(testEvents2, 2);
+            AssertUnassignedThenAssigned(testEvents1, 2);
+            AssertUnassignedThenAssigned(testEvents2, 2);
             AssertAssigned(testEvents3, 2);
             
             // clean up
@@ -156,6 +156,14 @@ namespace Rebalanser.ZooKeeper.Tests
         }
 
         private void AssertAssigned(List<TestEvent> testEvents, int count)
+        {
+            Assert.Equal(1, testEvents.Count);
+            Assert.Equal(EventType.Assignment, testEvents[0].EventType);
+            Assert.Equal(count, testEvents[0].Resources.Count);
+            testEvents.Clear();
+        }
+        
+        private void AssertUnassignedThenAssigned(List<TestEvent> testEvents, int count)
         {
             Assert.Equal(2, testEvents.Count);
             Assert.Equal(EventType.Unassignment, testEvents[0].EventType);
@@ -212,12 +220,13 @@ namespace Rebalanser.ZooKeeper.Tests
 
         private IRebalanserProvider GetProvider()
         {
-            return new ZooKeeperProvider("localhost:2181", 
+            return new ZooKeeperProvider(ZkHelper.ZooKeeperHosts, 
                 "/rebalanser", 
                 TimeSpan.FromSeconds(20),
                 TimeSpan.FromSeconds(20),
+                TimeSpan.FromSeconds(5),
                 RebalancingMode.ResourceBarrier,
-                new ConsoleLogger());
+                new TestOutputLogger());
         }
 
         public void Dispose()

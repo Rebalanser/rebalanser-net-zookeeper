@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
@@ -7,40 +8,34 @@ using org.apache.zookeeper;
 using Rebalanser.Core;
 using Rebalanser.Core.Logging;
 using Rebalanser.ZooKeeper.GlobalBarrier;
-using Rebalanser.ZooKeeper.Store;
+using Rebalanser.ZooKeeper.ResourceManagement;
 using Rebalanser.ZooKeeper.Zk;
 
 namespace Rebalanser.ZooKeeper.ResourceBarrier
 {
     public class Follower : Watcher, IFollower
     {
+        // services
         private IZooKeeperService zooKeeperService;
         private ILogger logger;
-        private ResourceGroupStore store;
+        private ResourceManager store;
+        
+        // immutable state
         private string clientId;
         private int clientNumber;
-        private OnChangeActions onChangeActions;
         private CancellationToken followerToken;
-        private FollowerStatus followerStatus;
-        private bool statusChange;
+        
+        // mutable state
         private string watchSiblingPath;
         private string siblingId;
         private Task rebalancingTask;
         private CancellationTokenSource rebalancingCts;
-        private int resourcesVersion;
-        
-
-        private enum SiblingCheckResult
-        {
-            WatchingNewSibling,
-            IsNewLeader,
-            Error
-        }
+        private BlockingCollection<FollowerEvent> events;
+        private bool ignoreWatches;
         
         public Follower(IZooKeeperService zooKeeperService,
             ILogger logger,
-            ResourceGroupStore store,
-            OnChangeActions onChangeActions,
+            ResourceManager store,
             string clientId,
             int clientNumber,
             string watchSiblingPath,
@@ -49,7 +44,6 @@ namespace Rebalanser.ZooKeeper.ResourceBarrier
             this.zooKeeperService = zooKeeperService;
             this.logger = logger;
             this.store = store;
-            this.onChangeActions = onChangeActions;
             this.clientId = clientId;
             this.clientNumber = clientNumber;
             this.watchSiblingPath = watchSiblingPath;
@@ -57,92 +51,132 @@ namespace Rebalanser.ZooKeeper.ResourceBarrier
             this.followerToken = followerToken;
             
             this.rebalancingCts = new CancellationTokenSource();
+            this.events = new BlockingCollection<FollowerEvent>();
         }
 
-        public async Task<bool> BecomeFollowerAsync()
+        public async Task<BecomeFollowerResult> BecomeFollowerAsync()
         {
-            var watchSiblingRes = await this.zooKeeperService.WatchSiblingNodeAsync(this.watchSiblingPath, this);
-            if (watchSiblingRes != ZkResult.Ok)
+            try
             {
-                if(watchSiblingRes == ZkResult.NoZnode)
-                    this.logger.Info(this.clientId, $"Follower - Could not set a watch on sibling node {this.watchSiblingPath} as it no longer exists");
-                return false;
-            }
-            
-            this.logger.Info(this.clientId, $"Follower - Set a watch on sibling node {this.watchSiblingPath}");
+                this.ignoreWatches = false;
+                await this.zooKeeperService.WatchSiblingNodeAsync(this.watchSiblingPath, this);
+                this.logger.Info(this.clientId, $"Follower - Set a watch on sibling node {this.watchSiblingPath}");
 
-            var watchStatusRes = await this.zooKeeperService.WatchResourcesDataAsync(this);
-            if (watchStatusRes.Result != ZkResult.Ok)
+                await this.zooKeeperService.WatchResourcesDataAsync(this);
+                this.logger.Info(this.clientId, $"Follower - Set a watch on resources node");
+            }
+            catch (ZkNoEphemeralNodeWatchException)
             {
-                this.logger.Info(this.clientId, $"Follower - Could not set a watch on resources node");
-                return false;
+                this.logger.Info(this.clientId, "Follower - Could not set a watch on the sibling node as it has gone");
+                return BecomeFollowerResult.WatchSiblingGone;
             }
-            
-            this.logger.Info(this.clientId, $"Follower - Set a watch on resources node");
+            catch (Exception e)
+            {
+                this.logger.Error("Follower - Could not become a follower due to an error", e);
+                return BecomeFollowerResult.Error;
+            }
 
-            this.resourcesVersion = watchStatusRes.Data;
-            
-            return true;
+            return BecomeFollowerResult.Ok;
         }
         
+        
+        // Important that nothing throws an exception in this method as it is called from the zookeeper library
         public override async Task process(WatchedEvent @event)
         {
+            if (this.followerToken.IsCancellationRequested || this.ignoreWatches)
+                return;
+                
+            if(@event.getPath() != null)
+                this.logger.Info(this.clientId, $"Follower - KEEPER EVENT {@event.getState()} - {@event.get_Type()} - {@event.getPath()}");
+            else 
+                this.logger.Info(this.clientId, $"Follower - KEEPER EVENT {@event.getState()} - {@event.get_Type()}");
+            
             switch (@event.getState())
             {
                 case Event.KeeperState.Expired:
-                    this.followerStatus = FollowerStatus.SessionExpired;
+                    this.events.Add(FollowerEvent.SessionExpired);
                     break;
                 case Event.KeeperState.Disconnected:
                     break;
-                case Event.KeeperState.SyncConnected:
                 case Event.KeeperState.ConnectedReadOnly:
-                    if (@event.getPath() != null)
+                case Event.KeeperState.SyncConnected:
+                    if (@event.get_Type() == Event.EventType.NodeDeleted)
                     {
                         if (@event.getPath().EndsWith(this.siblingId))
                         {
-                            await PerformLeaderCheck();
+                            await PerformLeaderCheckAsync();
                         }
-                        // status change
-                        else if (@event.getPath().EndsWith("resources"))
+                        else
                         {
-                            var watchStatusRes = await this.zooKeeperService.WatchResourcesDataAsync(this);
-                            if (watchStatusRes.Result != ZkResult.Ok)
-                                this.followerStatus = FollowerStatus.UnexpectedFailure;
-                            else
-                            {
-                                this.statusChange = true;
-                                this.resourcesVersion = watchStatusRes.Data;
-                            }
+                            this.logger.Error(this.clientId, $"Follower - Unexpected node deletion detected of {@event.getPath()}");
+                            this.events.Add(FollowerEvent.PotentialInconsistentState);
                         }
                     }
+                    else if (@event.get_Type() == Event.EventType.NodeDataChanged)
+                    {
+                        if (@event.getPath().EndsWith("resources"))
+                            await SendTriggerRebalancingEvent();
+                    }
+
                     break;
                 default:
-                    this.followerStatus = FollowerStatus.UnexpectedFailure;
                     this.logger.Error(this.clientId,
                         $"Follower - Currently this library does not support ZooKeeper state {@event.getState()}");
+                    this.events.Add(FollowerEvent.PotentialInconsistentState);
                     break;
             }
-
-            await Task.Yield();
         }
         
-        public async Task<FollowerStatus> StartEventLoopAsync()
+        public async Task<FollowerExitReason> StartEventLoopAsync()
         {
+            // it is possible that rebalancing has been triggered already, so check 
+            // if any resources have been assigned already and if so, add a RebalancingTriggered event
+            await CheckForRebalancingAsync();
+            
             while (!this.followerToken.IsCancellationRequested)
             {
-                if (this.followerStatus != FollowerStatus.Ok)
+                FollowerEvent followerEvent;
+                if (this.events.TryTake(out followerEvent))
                 {
-                    await CancelRebalancingIfInProgressAsync();
-                    InvokeOnStopActions();
-                    return this.followerStatus;
-                }
-                
-                if (this.statusChange)
-                {
-                    await CancelRebalancingIfInProgressAsync();
-                    logger.Info(this.clientId, "Follower - Rebalancing triggered");
-                    this.statusChange = false;
-                    rebalancingTask = Task.Run(async () => await RespondToRebalancing(this.rebalancingCts.Token, 1));
+                    switch (followerEvent)
+                    {
+                        case FollowerEvent.SessionExpired:
+                            await CleanUpAsync();
+                            return FollowerExitReason.SessionExpired;
+
+                        case FollowerEvent.IsNewLeader:
+                            await CleanUpAsync();
+                            return FollowerExitReason.PossibleRoleChange;
+
+                        case FollowerEvent.PotentialInconsistentState:
+                            await CleanUpAsync();
+                            return FollowerExitReason.PotentialInconsistentState;
+                        
+                        case FollowerEvent.FatalError:
+                            await CleanUpAsync();
+                            return FollowerExitReason.FatalError;
+
+                        case FollowerEvent.RebalancingTriggered:
+                            if (this.events.Any())
+                            {
+                                // skip this event. All other events take precedence over rebalancing
+                                // there may be multiple rebalancing events, so if the events collection
+                                // consists only of rebalancing events then we'll just process the last one
+                            }
+                            else
+                            {
+                                await CancelRebalancingIfInProgressAsync();
+                                logger.Info(this.clientId, "Follower - Rebalancing triggered");
+                                rebalancingTask = Task.Run(async () =>
+                                    await RespondToRebalancing(this.rebalancingCts.Token));
+                            }
+
+                            break;
+                        
+                        default:
+                            await CleanUpAsync();
+                            return FollowerExitReason.PotentialInconsistentState;
+                    }
                 }
 
                 await WaitFor(1000);
@@ -150,124 +184,117 @@ namespace Rebalanser.ZooKeeper.ResourceBarrier
 
             if (this.followerToken.IsCancellationRequested)
             {
-                await CancelRebalancingIfInProgressAsync();
+                await CleanUpAsync();
                 await this.zooKeeperService.CloseSessionAsync();
-                return FollowerStatus.Cancelled;
+                return FollowerExitReason.Cancelled;
             }
 
-            return FollowerStatus.UnexpectedFailure;
+            return FollowerExitReason.PotentialInconsistentState;
+        }
+
+        private async Task SendTriggerRebalancingEvent()
+        {
+            try
+            {
+                await this.zooKeeperService.WatchResourcesDataAsync(this);
+                this.events.Add(FollowerEvent.RebalancingTriggered);
+            }
+            catch (Exception e)
+            {
+                this.logger.Error("Could not put a watch on the resources node", e);
+                this.events.Add(FollowerEvent.PotentialInconsistentState);
+            }
+        }
+
+        private async Task CheckForRebalancingAsync()
+        {
+            var resources = await this.zooKeeperService.GetResourcesAsync(null, null);
+            var assignedResources = resources.ResourceAssignments.Assignments
+                .Where(x => x.ClientId.Equals(this.clientId))
+                .Select(x => x.Resource)
+                .ToList();
+            
+            if(assignedResources.Any())
+                this.events.Add(FollowerEvent.RebalancingTriggered);
         }
         
-        private async Task RespondToRebalancing(CancellationToken rebalancingToken, int attempt)
+        private async Task RespondToRebalancing(CancellationToken rebalancingToken)
         {
             try
             {
                 var result = await ProcessStatusChangeAsync(rebalancingToken);
                 switch (result)
                 {
-                    case RebalancingResult.Complete: 
+                    case RebalancingResult.Complete:
                         logger.Info(this.clientId, "Follower - Rebalancing complete");
                         break;
+
                     case RebalancingResult.Cancelled:
                         logger.Info(this.clientId, "Follower - Rebalancing cancelled");
                         break;
-                    case RebalancingResult.SessionExpired:
-                        logger.Info(this.clientId, "Follower - Rebalancing aborted, lost session");
-                        this.followerStatus = FollowerStatus.SessionExpired;
-                        break;
-                    case RebalancingResult.Failure:
-                        attempt++;
-                        if (attempt > 3)
-                        {
-                            this.followerStatus = FollowerStatus.UnexpectedFailure;
-                        }
-                        else
-                        {
-                            this.logger.Error(this.clientId, $"Follower - Rebalancing failed. Will retry again with attempt {attempt}");
-                            await RespondToRebalancing(rebalancingToken, attempt);
-                        }
 
-                        break;
-                    default: 
-                        this.logger.Error(this.clientId, $"Follower - A non-supported RebalancingResult has been returned: {result}");
-                        this.followerStatus = FollowerStatus.UnexpectedFailure;
+                    default:
+                        this.logger.Error(this.clientId,
+                            $"Follower - A non-supported RebalancingResult has been returned: {result}");
+                        this.events.Add(FollowerEvent.PotentialInconsistentState);
                         break;
                 }
             }
-            catch (Exception ex)
+            catch (ZkSessionExpiredException)
             {
-                this.logger.Error(this.clientId, "Follower - An unexpected error has occurred, aborting rebalancing", ex);
-                this.followerStatus = FollowerStatus.UnexpectedFailure;
+                this.logger.Warn(this.clientId, $"Follower - The session was lost during rebalancing");
+                this.events.Add(FollowerEvent.SessionExpired);
+            }
+            catch (InconsistentStateException e)
+            {
+                this.logger.Error(this.clientId, $"Follower - An error occurred potentially leaving the client in an inconsistent state. Termination of the client or creationg of a new session will follow", e);
+                if(await this.store.SafeInvokeOnErrorActionsAsync(this.clientId, "Client error", e))
+                    this.events.Add(FollowerEvent.PotentialInconsistentState);
+                else
+                    this.events.Add(FollowerEvent.FatalError);
+            }
+            catch (TerminateClientException e)
+            {
+                this.logger.Error(this.clientId, $"Follower - A fatal error occurred, aborting", e);
+                await this.store.SafeInvokeOnErrorActionsAsync(this.clientId, "Fatal client error", e);
+                this.events.Add(FollowerEvent.FatalError);
+            }
+            catch (Exception e)
+            {
+                this.logger.Error(this.clientId, $"Follower - Rebalancing failed.", e);
+                if(await this.store.SafeInvokeOnErrorActionsAsync(this.clientId, "Client error", e))
+                    this.events.Add(FollowerEvent.PotentialInconsistentState);
+                else
+                    this.events.Add(FollowerEvent.FatalError);
             }
         }
 
         private async Task<RebalancingResult> ProcessStatusChangeAsync(CancellationToken rebalancingToken)
         {
-            this.statusChange = false;
-        
-            var resourcesRes = await this.zooKeeperService.GetResourcesAsync();
-            if (resourcesRes.Result != ZkResult.Ok)
-            {
-                if (resourcesRes.Result == ZkResult.SessionExpired)
-                    return RebalancingResult.SessionExpired;
-                
-                return RebalancingResult.Failure;
-            }
+            await this.store.InvokeOnStopActionsAsync(this.clientId, "Follower");
             
-            var currAssignmentRes = this.store.GetResources();
-            InvokeOnStopActions();
-            
-            foreach (var resource in currAssignmentRes.Resources)
-            {
-                var removeBarrierRes = await this.zooKeeperService.RemoveResourceBarrierAsync(resource);
-                if(removeBarrierRes != ZkResult.Ok)
-                    return RebalancingResult.Failure;
-            }
-            
-            var resources = resourcesRes.Data;
+            var resources = await this.zooKeeperService.GetResourcesAsync(null, null);
             var assignedResources = resources.ResourceAssignments.Assignments
                 .Where(x => x.ClientId.Equals(this.clientId))
                 .Select(x => x.Resource)
                 .ToList();
 
-            foreach (var newResource in assignedResources)
-            {
-                var barrierAdded = await TryPutResourceBarrierAsync(newResource, rebalancingToken);
-                if (!barrierAdded)
-                {
-                    if (rebalancingToken.IsCancellationRequested)
-                        return RebalancingResult.Cancelled;
-                }
-            }
-            
-            this.store.SetResources(new SetResourcesRequest()
-            {
-                AssignmentStatus = AssignmentStatus.ResourcesAssigned, 
-                Resources = assignedResources
-            });
-            InvokeOnStartActions(assignedResources);
+            await this.store.InvokeOnStartActionsAsync(this.clientId, "Follower", assignedResources, rebalancingToken, this.followerToken);
             
             return RebalancingResult.Complete;
         }
-        
-        private async Task<bool> TryPutResourceBarrierAsync(string resource, CancellationToken token)
+       
+        private async Task CleanUpAsync()
         {
-            while (!token.IsCancellationRequested)
+            try
             {
-                var putBarrierRes = await this.zooKeeperService.TryPutResourceBarrierAsync(resource);
-                if (putBarrierRes == ZkResult.Ok)
-                    return true;
-
-                if (putBarrierRes == ZkResult.NodeAlreadyExists)
-                {
-                    await WaitFor(1000, token);
-                    continue;
-                }
-
-                return false;
+                this.ignoreWatches = true;
+                await CancelRebalancingIfInProgressAsync();
             }
-
-            return false;
+            finally
+            {
+                await this.store.InvokeOnStopActionsAsync(this.clientId, "Follower");
+            }
         }
         
         private async Task CancelRebalancingIfInProgressAsync()
@@ -276,23 +303,19 @@ namespace Rebalanser.ZooKeeper.ResourceBarrier
             {
                 logger.Info(this.clientId, "Follower - Cancelling the rebalancing that is in progress");
                 this.rebalancingCts.Cancel();
-                await this.rebalancingTask; // might need to put a time limit on this
+                try
+                {
+                    await this.rebalancingTask; // might need to put a time limit on this
+                }
+                catch (Exception ex)
+                {
+                    this.logger.Error(this.clientId, "Follower - Errored on cancelling rebalancing", ex);
+                    this.events.Add(FollowerEvent.PotentialInconsistentState);
+                }
                 this.rebalancingCts = new CancellationTokenSource(); // reset cts
             }
         }
 
-        private void InvokeOnStopActions()
-        {
-            foreach(var onStopAction in this.onChangeActions.OnStopActions)
-                onStopAction.Invoke();
-        }
-        
-        private void InvokeOnStartActions(List<string> assignedResources)
-        {
-            foreach(var onStartAction in this.onChangeActions.OnStartActions)
-                onStartAction.Invoke(assignedResources);
-        }
-        
         private async Task WaitFor(int milliseconds)
         {
             try
@@ -303,70 +326,59 @@ namespace Rebalanser.ZooKeeper.ResourceBarrier
             {}
         }
         
-        private async Task WaitFor(int milliseconds, CancellationToken token)
+        private async Task PerformLeaderCheckAsync()
         {
-            try
+            bool checkComplete = false;
+            while (!checkComplete)
             {
-                await Task.Delay(milliseconds, token);
-            }
-            catch (TaskCanceledException)
-            {}
-        }
-
-        private async Task PerformLeaderCheck()
-        {
-            var siblingResult = await CheckForSiblings();
-            switch (siblingResult)
-            {
-                case SiblingCheckResult.WatchingNewSibling:
-                    break;
-                case SiblingCheckResult.IsNewLeader:
-                    this.followerStatus = FollowerStatus.IsNewLeader;
-                    break;
-                case SiblingCheckResult.Error:
-                    this.followerStatus = FollowerStatus.UnexpectedFailure;
-                    break;
-                default:
-                    this.logger.Error(this.clientId,
-                        $"Follower - Non-supported SiblingCheckResult {siblingResult}");
-                    break;
-            }
-        }
-        
-        private async Task<SiblingCheckResult> CheckForSiblings()
-        {
-            int maxClientNumber = -1;
-            string watchChild = string.Empty;
-            var clientsRes = await this.zooKeeperService.GetActiveClientsAsync();
-            if (clientsRes.Result != ZkResult.Ok)
-                return SiblingCheckResult.Error;
-                
-            var clients = clientsRes.Data;
-            foreach (var childPath in clients.ClientPaths)
-            {
-                int siblingClientNumber = int.Parse(childPath.Substring(childPath.Length - 10, 10));
-                if (siblingClientNumber > maxClientNumber && siblingClientNumber < this.clientNumber)
+                try
                 {
-                    watchChild = childPath;
-                    maxClientNumber = siblingClientNumber;
+                    int maxClientNumber = -1;
+                    string watchChild = string.Empty;
+                    var clients = await this.zooKeeperService.GetActiveClientsAsync();
+
+                    foreach (var childPath in clients.ClientPaths)
+                    {
+                        int siblingClientNumber = int.Parse(childPath.Substring(childPath.Length - 10, 10));
+                        if (siblingClientNumber > maxClientNumber && siblingClientNumber < this.clientNumber)
+                        {
+                            watchChild = childPath;
+                            maxClientNumber = siblingClientNumber;
+                        }
+                    }
+
+                    if (maxClientNumber == -1)
+                    {
+                        this.events.Add(FollowerEvent.IsNewLeader);
+                    }
+                    else
+                    {
+                        this.watchSiblingPath = watchChild;
+                        this.siblingId = watchSiblingPath.Substring(watchChild.LastIndexOf("/", StringComparison.Ordinal));
+                        await this.zooKeeperService.WatchSiblingNodeAsync(watchChild, this);
+                        this.logger.Info(this.clientId, $"Follower - Set a watch on sibling node {this.watchSiblingPath}");
+                    }
+
+                    checkComplete = true;
+                }
+                catch (ZkNoEphemeralNodeWatchException)
+                {
+                    // do nothing except wait, the next iteration will find
+                    // another client or it wil detect that it itself is the new leader
+                    await WaitFor(1000);
+                }
+                catch (ZkSessionExpiredException)
+                {
+                    this.events.Add(FollowerEvent.SessionExpired);
+                    checkComplete = true;
+                }
+                catch (Exception ex)
+                {
+                    this.logger.Error(this.clientId, "Follower - Failed looking for sibling to watch", ex);
+                    this.events.Add(FollowerEvent.PotentialInconsistentState);
+                    checkComplete = true;
                 }
             }
-
-            if (maxClientNumber == -1)
-                return SiblingCheckResult.IsNewLeader;
-            
-            this.watchSiblingPath = watchChild;
-            this.siblingId = watchSiblingPath.Substring(watchChild.LastIndexOf("/", StringComparison.Ordinal));
-            var newWatchRes = await this.zooKeeperService.WatchSiblingNodeAsync(watchChild, this);
-            if (newWatchRes != ZkResult.Ok)
-            {
-                this.logger.Info(this.clientId, $"Follower - Could not set a watch on sibling node {this.watchSiblingPath} as it no longer exists");
-                return SiblingCheckResult.Error;
-            }
-            
-            this.logger.Info(this.clientId, $"Follower - Set a watch on sibling node {this.watchSiblingPath}");
-
-            return SiblingCheckResult.WatchingNewSibling;
         }
     }
 }

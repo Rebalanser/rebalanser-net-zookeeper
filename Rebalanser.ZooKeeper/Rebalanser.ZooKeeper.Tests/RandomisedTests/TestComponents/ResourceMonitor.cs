@@ -26,27 +26,28 @@ namespace Rebalanser.ZooKeeper.Tests.RandomisedTests.TestComponents
             this.resources.Add(resourceName, "");
         }
 
-        public List<object> GetViolations()
+        public List<object> GetDoubleAssignments()
         {
             return this.violations;
         }
 
-        public bool ViolationsExist()
+        public bool DoubleAssignmentsExist()
         {
             return this.violations.Any();
         }
         
         public bool AllResourcesAssigned()
         {
-            foreach (var resource in this.resources)
+            var unassigned = this.resources.Where(x => x.Value == string.Empty).ToList();
+            if (unassigned.Any())
             {
-                if (resource.Value.Equals(string.Empty))
-                    return false;
+                Console.WriteLine($"{DateTime.Now.ToString("hh:mm:ss,fff")}Unassigned resources: {string.Join(",", unassigned)}");
+                return false;
             }
 
             return true;
         }
-
+ 
         public void Clear()
         {
             this.resources.Clear();
@@ -60,21 +61,24 @@ namespace Rebalanser.ZooKeeper.Tests.RandomisedTests.TestComponents
                 ClientId = clientId,
                 Action = $"Assign {resourceName}"
             });
-            string currValue = this.resources[resourceName];
-            if (currValue.Equals(string.Empty))
+            if (this.resources.ContainsKey(resourceName))
             {
-                this.resources[resourceName] = clientId;
-            }
-            else
-            {
-                var violation = new ClaimViolation(resourceName, currValue, clientId);
-                this.assignmentEvents.Enqueue(new AssignmentEvent()
+                string currValue = this.resources[resourceName];
+                if (currValue.Equals(string.Empty))
                 {
-                    ClientId = clientId,
-                    Action = violation.ToString(),
-                    EventTime = DateTime.Now
-                });
-                this.violations.Add(violation);
+                    this.resources[resourceName] = clientId;
+                }
+                else
+                {
+                    var violation = new ClaimViolation(resourceName, currValue, clientId);
+                    this.assignmentEvents.Enqueue(new AssignmentEvent()
+                    {
+                        ClientId = clientId,
+                        Action = violation.ToString(),
+                        EventTime = DateTime.Now
+                    });
+                    this.violations.Add(violation);
+                }
             }
         }
         
@@ -93,6 +97,10 @@ namespace Rebalanser.ZooKeeper.Tests.RandomisedTests.TestComponents
                 if (currValue.Equals(clientId))
                 {
                     this.resources[resourceName] = string.Empty;
+                }
+                else if (currValue.Equals(string.Empty))
+                {
+                    // fine
                 }
                 else
                 {
@@ -163,9 +171,10 @@ namespace Rebalanser.ZooKeeper.Tests.RandomisedTests.TestComponents
                 else
                     break;
             }
-            
+
+            var resList = new List<KeyValuePair<string, string>>(this.resources.ToList());
             lines.Add($"||---- Resource Assignment State -----");
-            foreach(var kv in this.resources)
+            foreach(var kv in resList)
                 lines.Add($"||{kv.Key}->{kv.Value}");
             lines.Add("||------------------------------------");
             

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
@@ -7,80 +8,91 @@ using System.Threading.Tasks;
 using org.apache.zookeeper;
 using Rebalanser.Core;
 using Rebalanser.Core.Logging;
-using Rebalanser.ZooKeeper.Store;
+using Rebalanser.ZooKeeper.ResourceManagement;
 using Rebalanser.ZooKeeper.Zk;
 
 namespace Rebalanser.ZooKeeper.ResourceBarrier
 {
     public class Coordinator : Watcher, ICoordinator
     {
+        // services
         private IZooKeeperService zooKeeperService;
         private ILogger logger;
-        private ResourceGroupStore store;
-        private TimeSpan rebalancingTimeLimit;
-        private OnChangeActions onChangeActions;
+        private ResourceManager store;
+        
+        // immutable state
+        private readonly TimeSpan rebalancingTimeLimit;
+        private readonly CancellationToken coordinatorToken;
+        private readonly string clientId;
+        private readonly TimeSpan minimumRebalancingInterval;
+        
+        // mutable state
         private Task rebalancingTask;
-        private CancellationToken coordinatorToken;
         private CancellationTokenSource rebalancingCts;
-        private bool pendingRebalancing;
-        private CoordinatorExitReason eventCoordinatorExitReason;
-        private string clientId;
         private int resourcesVersion;
+        private BlockingCollection<CoordinatorEvent> events;
+        private bool ignoreWatches;
 
         public Coordinator(IZooKeeperService zooKeeperService,
             ILogger logger,
-            ResourceGroupStore store,
-            OnChangeActions onChangeActions,
+            ResourceManager store,
             string clientId,
+            TimeSpan minimumRebalancingInterval,
             CancellationToken coordinatorToken)
         {
             this.zooKeeperService = zooKeeperService;
             this.logger = logger;
             this.store = store;
             this.rebalancingTimeLimit = TimeSpan.FromSeconds(120);
-            this.onChangeActions = onChangeActions;
             this.clientId = clientId;
+            this.minimumRebalancingInterval = minimumRebalancingInterval;
             this.coordinatorToken = coordinatorToken;
+            
             this.rebalancingCts = new CancellationTokenSource();
+            this.events = new BlockingCollection<CoordinatorEvent>();
         }
         
+        // very important that this method does not throw any exceptions as it is called from the zookeeper library
         public override async Task process(WatchedEvent @event)
         {
-            if (this.coordinatorToken.IsCancellationRequested)
+            if (this.coordinatorToken.IsCancellationRequested || this.ignoreWatches)
                 return;
+            
+            if(@event.getPath() != null)
+                this.logger.Info(this.clientId, $"Coordinator - KEEPER EVENT {@event.getState()} - {@event.get_Type()} - {@event.getPath()}");
+            else 
+                this.logger.Info(this.clientId, $"Coordinator - KEEPER EVENT {@event.getState()} - {@event.get_Type()}");
 
             switch (@event.getState())
             {
                 case Event.KeeperState.Expired:
-                    this.eventCoordinatorExitReason = CoordinatorExitReason.SessionExpired;
+                    this.events.Add(CoordinatorEvent.SessionExpired);
                     break;
                 case Event.KeeperState.Disconnected:
                     break;
-                case Event.KeeperState.SyncConnected:
                 case Event.KeeperState.ConnectedReadOnly:
+                case Event.KeeperState.SyncConnected:
                     if (@event.getPath() != null)
                     {
-                        if (@event.getPath().EndsWith("epoch"))
+                        if(@event.get_Type() == Event.EventType.NodeDataChanged)
                         {
-                            this.eventCoordinatorExitReason = CoordinatorExitReason.NotCoordinator;
+                            if (@event.getPath().EndsWith("epoch"))
+                                this.events.Add(CoordinatorEvent.NoLongerCoordinator);
                         }
-                        else if (@event.getPath().EndsWith("resources"))
+                        else if (@event.get_Type() == Event.EventType.NodeChildrenChanged)
                         {
-                            await this.zooKeeperService.WatchResourcesChildrenAsync(this);
-                            pendingRebalancing = true;
-                        }
-                        else if(@event.getPath().EndsWith("clients"))
-                        {
-                            await this.zooKeeperService.WatchNodesAsync(this);
-                            pendingRebalancing = true;
+                            if (@event.getPath().EndsWith("resources"))
+                                this.events.Add(CoordinatorEvent.RebalancingTriggered);
+                            else if (@event.getPath().EndsWith("clients"))
+                                this.events.Add(CoordinatorEvent.RebalancingTriggered);
                         }
                     }
 
                     break;
                 default:
-                    this.eventCoordinatorExitReason = CoordinatorExitReason.Unknown;
                     this.logger.Error(this.clientId,
                         $"Coordinator - Currently this library does not support ZooKeeper state {@event.getState()}");
+                    this.events.Add(CoordinatorEvent.PotentialInconsistentState);
                     break;
             }
 
@@ -89,64 +101,84 @@ namespace Rebalanser.ZooKeeper.ResourceBarrier
         
         public async Task<BecomeCoordinatorResult> BecomeCoordinatorAsync(int currentEpoch)
         {
-            var incEpochRes = await this.zooKeeperService.IncrementEpochAsync(currentEpoch);
-            if (incEpochRes.Result != ZkResult.Ok)
+            try
             {
-                if(incEpochRes.Result == ZkResult.BadVersion)
-                    return BecomeCoordinatorResult.StaleEpoch;
+                this.ignoreWatches = false;
+                await this.zooKeeperService.IncrementAndWatchEpochAsync(currentEpoch, this);
+                await this.zooKeeperService.WatchNodesAsync(this);
 
+                var getResourcesRes = await this.zooKeeperService.GetResourcesAsync(this, null);
+                this.resourcesVersion = getResourcesRes.Version;
+            }
+            catch (ZkStaleVersionException e)
+            {
+                this.logger.Error(this.clientId, "Could not become coordinator as a stale version number was used", e);
+                return BecomeCoordinatorResult.StaleEpoch;
+            }
+            catch (ZkInvalidOperationException e)
+            {
+                this.logger.Error(this.clientId, "Could not become coordinator as an invalid ZooKeeper operation occurred", e);
                 return BecomeCoordinatorResult.Error;
             }
-            
-            var watchEpochRes = await this.zooKeeperService.WatchEpochAsync(this);
-            if (watchEpochRes.Result != ZkResult.Ok)
-                return BecomeCoordinatorResult.Error;
-            
-            if(watchEpochRes.Data != incEpochRes.Data)
-                return BecomeCoordinatorResult.StaleEpoch;
-            
-            var watchNodesRes = await this.zooKeeperService.WatchNodesAsync(this);
-            if (watchNodesRes != ZkResult.Ok)
-                return BecomeCoordinatorResult.Error;
-            
-            var watchResourcesRes = await this.zooKeeperService.WatchResourcesChildrenAsync(this);
-            if (watchResourcesRes != ZkResult.Ok)
-                return BecomeCoordinatorResult.Error;
 
-            var getResourcesRes = await this.zooKeeperService.GetResourcesAsync();
-            if (getResourcesRes.Result != ZkResult.Ok)
-                return BecomeCoordinatorResult.Error;
-            
-            this.resourcesVersion = getResourcesRes.Data.Version;
-            
-            this.pendingRebalancing = true;
+            this.events.Add(CoordinatorEvent.RebalancingTriggered);
             return BecomeCoordinatorResult.Ok;
         }
 
         public async Task<CoordinatorExitReason> StartEventLoopAsync()
         {
-            int logicalTimeSinceRebalancingTrigger = 0;
+            var rebalanceTimer = new Stopwatch();
+            
             while (!this.coordinatorToken.IsCancellationRequested)
             {
-                logicalTimeSinceRebalancingTrigger++;
-                
-                if (this.eventCoordinatorExitReason != CoordinatorExitReason.NoExit)
+                CoordinatorEvent coordinatorEvent;
+                if (this.events.TryTake(out coordinatorEvent))
                 {
-                    await CancelRebalancingIfInProgressAsync();
-                    return this.eventCoordinatorExitReason;
+                    switch (coordinatorEvent)
+                    {
+                        case CoordinatorEvent.SessionExpired:
+                            await CleanUpAsync();
+                            return CoordinatorExitReason.SessionExpired;
+                        
+                        case CoordinatorEvent.NoLongerCoordinator:
+                            await CleanUpAsync();
+                            return CoordinatorExitReason.NoLongerCoordinator;
+                        
+                        case CoordinatorEvent.PotentialInconsistentState:
+                            await CleanUpAsync();
+                            return CoordinatorExitReason.PotentialInconsistentState;
+                        
+                        case CoordinatorEvent.FatalError:
+                            await CleanUpAsync();
+                            return CoordinatorExitReason.FatalError;
+                        
+                        case CoordinatorEvent.RebalancingTriggered:
+                            if (this.events.Any())
+                            {
+                                // skip this event. All other events take precedence over rebalancing
+                                // there may be multiple rebalancing events, so if the events collection
+                                // consists only of rebalancing events then we'll just process the last one
+                            }
+                            else if (!rebalanceTimer.IsRunning || rebalanceTimer.Elapsed > this.minimumRebalancingInterval)
+                            {
+                                await CancelRebalancingIfInProgressAsync();
+                                rebalanceTimer.Reset();
+                                rebalanceTimer.Start();
+                                logger.Info(this.clientId, "Coordinator - Rebalancing triggered");
+                                rebalancingTask = Task.Run(async () => await TriggerRebalancing(this.rebalancingCts.Token, 1));
+                            }
+                            else
+                            {
+                                // if enough time has not passed since the last rebalancing just readd it
+                                this.events.Add(CoordinatorEvent.RebalancingTriggered);   
+                            }
+                            break;
+                        default:
+                            await CleanUpAsync();
+                            return CoordinatorExitReason.PotentialInconsistentState;
+                    }
                 }
-                
-                // if a rebalancing event has occurred, delay the start of rebalancing a little
-                // prevents multiple close together events causing multiple aborted rebalancings
-                if (logicalTimeSinceRebalancingTrigger > 5 && pendingRebalancing)
-                {
-                    await CancelRebalancingIfInProgressAsync();
-                    logger.Info(this.clientId, "Coordinator - Rebalancing triggered");
-                    pendingRebalancing = false;
-                    logicalTimeSinceRebalancingTrigger = 0;
-                    rebalancingTask = Task.Run(async () => await TriggerRebalancing(this.rebalancingCts.Token, 1));
-                }
-                
+
                 await WaitFor(1000);
             }
 
@@ -157,7 +189,20 @@ namespace Rebalanser.ZooKeeper.ResourceBarrier
                 return CoordinatorExitReason.Cancelled;
             }
 
-            return CoordinatorExitReason.Unknown; // if this happens then we have a correctness bug
+            return CoordinatorExitReason.PotentialInconsistentState; // if this happens then we have a correctness bug
+        }
+        
+        private async Task CleanUpAsync()
+        {
+            try
+            {
+                this.ignoreWatches = true;
+                await CancelRebalancingIfInProgressAsync();
+            }
+            finally
+            {
+                await this.store.InvokeOnStopActionsAsync(this.clientId, "Coordinator");
+            }
         }
 
         private async Task CancelRebalancingIfInProgressAsync()
@@ -166,7 +211,15 @@ namespace Rebalanser.ZooKeeper.ResourceBarrier
             {
                 logger.Info(this.clientId, "Coordinator - Cancelling the rebalancing that is in progress");
                 this.rebalancingCts.Cancel();
-                await this.rebalancingTask; // might need to put a time limit on this
+                try
+                {
+                    await this.rebalancingTask; // might need to put a time limit on this
+                }
+                catch (Exception ex)
+                {
+                    this.logger.Error(this.clientId, "Coordinator - Errored on cancelling rebalancing", ex);
+                    this.events.Add(CoordinatorEvent.PotentialInconsistentState);
+                }
                 this.rebalancingCts = new CancellationTokenSource(); // reset cts
             }
         }
@@ -181,61 +234,75 @@ namespace Rebalanser.ZooKeeper.ResourceBarrier
             {}
         }
         
-        private async Task WaitFor(int milliseconds, CancellationToken token)
-        {
-            try
-            {
-                await Task.Delay(milliseconds, token);
-            }
-            catch (TaskCanceledException)
-            {}
-        }
-
         private async Task TriggerRebalancing(CancellationToken rebalancingToken, int attempt)
         {
             try
             {
+                await this.zooKeeperService.WatchResourcesChildrenAsync(this);
+                await this.zooKeeperService.WatchNodesAsync(this);
+
                 var result = await RebalanceAsync(rebalancingToken);
                 switch (result)
                 {
-                    case RebalancingResult.Complete: 
+                    case RebalancingResult.Complete:
                         logger.Info(this.clientId, "Coordinator - Rebalancing complete");
                         break;
                     case RebalancingResult.Cancelled:
                         logger.Info(this.clientId, "Coordinator - Rebalancing cancelled");
                         break;
-                    case RebalancingResult.NotCoordinator:
-                        logger.Info(this.clientId, "Coordinator - Rebalancing aborted, lost coordinator role");
-                        this.eventCoordinatorExitReason = CoordinatorExitReason.NotCoordinator;
-                        break;
-                    case RebalancingResult.SessionExpired:
-                        logger.Info(this.clientId, "Coordinator - Rebalancing aborted, lost session");
-                        this.eventCoordinatorExitReason = CoordinatorExitReason.SessionExpired;
-                        break;
-                    case RebalancingResult.Failure:
-                    case RebalancingResult.TimeLimitExceeded:
-                        attempt++;
-                        if (attempt > 3)
-                        {
-                            this.eventCoordinatorExitReason = CoordinatorExitReason.RebalancingError;
-                        }
-                        else
-                        {
-                            this.logger.Error(this.clientId, $"Coordinator - Rebalancing failed. Will retry again with attempt {attempt}");
-                            await TriggerRebalancing(rebalancingToken, attempt);
-                        }
-
-                        break;
-                    default: 
-                        this.logger.Error(this.clientId, $"Coordinator - A non-supported RebalancingResult has been returned: {result}");
-                        this.eventCoordinatorExitReason = CoordinatorExitReason.RebalancingError;
-                        break;
                 }
             }
-            catch (Exception ex)
+            catch (ZkSessionExpiredException e)
             {
-                this.logger.Error(this.clientId, "Coordinator - An unexpected error has occurred, aborting rebalancing and becoming a follower", ex);
-                this.eventCoordinatorExitReason = CoordinatorExitReason.RebalancingError;
+                this.logger.Error(this.clientId, "Coordinator - The current session has expired", e);
+                this.events.Add(CoordinatorEvent.SessionExpired);
+            }
+            catch (ZkStaleVersionException e)
+            {
+                this.logger.Error(this.clientId,
+                    "Coordinator - A stale znode version was used, aborting rebalancing.", e);
+                this.events.Add(CoordinatorEvent.NoLongerCoordinator);
+            }
+            catch (ZkInvalidOperationException e)
+            {
+                this.logger.Error(this.clientId,
+                    "Coordinator - An invalid ZooKeeper operation occurred, aborting rebalancing.",
+                    e);
+                if(await this.store.SafeInvokeOnErrorActionsAsync(this.clientId, "Client error", e))
+                    this.events.Add(CoordinatorEvent.PotentialInconsistentState);
+                else
+                    this.events.Add(CoordinatorEvent.FatalError);
+            }
+            catch (InconsistentStateException e)
+            {
+                this.logger.Error(this.clientId,
+                    "Coordinator - An error occurred potentially leaving the client in an inconsistent state, aborting rebalancing.",
+                    e);
+                if(await this.store.SafeInvokeOnErrorActionsAsync(this.clientId, "Client error", e))
+                    this.events.Add(CoordinatorEvent.PotentialInconsistentState);
+                else
+                    this.events.Add(CoordinatorEvent.FatalError);
+            }
+            catch (TerminateClientException e)
+            {
+                this.logger.Error(this.clientId,
+                    "Coordinator - A fatal error has occurred, aborting rebalancing.",
+                    e);
+                await this.store.SafeInvokeOnErrorActionsAsync(this.clientId, "Client error", e);
+                this.events.Add(CoordinatorEvent.FatalError);
+            }
+            catch (ZkOperationCancelledException)
+            {
+                logger.Info(this.clientId, "Coordinator - Rebalancing cancelled");
+            }
+            catch (Exception e)
+            {
+                this.logger.Error(this.clientId,
+                    "Coordinator - An unexpected error has occurred, aborting rebalancing.", e);
+                if(await this.store.SafeInvokeOnErrorActionsAsync(this.clientId, "Client error", e))
+                    this.events.Add(CoordinatorEvent.PotentialInconsistentState);
+                else
+                    this.events.Add(CoordinatorEvent.FatalError);
             }
         }
 
@@ -244,38 +311,17 @@ namespace Rebalanser.ZooKeeper.ResourceBarrier
             var sw = new Stopwatch();
             sw.Start();
             
-            logger.Info(this.clientId, "Coordinator - PHASE 1 - Get clients and resources list");
-            var clientsRes = await this.zooKeeperService.GetActiveClientsAsync();
-            if (clientsRes.Result != ZkResult.Ok)
-            {
-                if (clientsRes.Result == ZkResult.SessionExpired)
-                    return RebalancingResult.SessionExpired;
-                
-                return RebalancingResult.Failure;
-            }
-
-            var clients = clientsRes.Data;
+            logger.Info(this.clientId, "Coordinator - Get clients and resources list");
+            var clients = await this.zooKeeperService.GetActiveClientsAsync();
+            var resources = await this.zooKeeperService.GetResourcesAsync(null, null);
             
-            var resourcesRes = await this.zooKeeperService.GetResourcesAsync();
-            if (resourcesRes.Result != ZkResult.Ok)
-            {
-                if (resourcesRes.Result == ZkResult.SessionExpired)
-                    return RebalancingResult.SessionExpired;
-                
-                return RebalancingResult.Failure;
-            }
-            
-            var resources = resourcesRes.Data;
             if (resources.Version != this.resourcesVersion)
-            {
-                this.logger.Error(this.clientId, "Coordinator - Resources znode version does not match expected value, indicates another client has been made coordinator and is executing a rebalancing. Stopping being coordinator now.");
-                return RebalancingResult.NotCoordinator;
-            }
+                throw new ZkStaleVersionException("Resources znode version does not match expected value, indicates another client has been made coordinator and is executing a rebalancing.");
 
             if (rebalancingToken.IsCancellationRequested) 
                 return RebalancingResult.Cancelled;
             
-            logger.Info(this.clientId, $"Coordinator - PHASE 2 - Assign resources ({string.Join(",", resources.Resources)}) to clients ({string.Join(",", clients.ClientPaths)})");
+            logger.Info(this.clientId, $"Coordinator - Assign resources ({string.Join(",", resources.Resources)}) to clients ({string.Join(",", clients.ClientPaths)})");
             var resourcesToAssign = new Queue<string>(resources.Resources);
             var resourceAssignments = new List<ResourceAssignment>();
             var clientIndex = 0;
@@ -294,71 +340,24 @@ namespace Rebalanser.ZooKeeper.ResourceBarrier
             
             // write assignments back to resources znode
             resources.ResourceAssignments.Assignments = resourceAssignments;
-            var setResourcesRes = await this.zooKeeperService.SetResourcesAsync(resources);
-            if (setResourcesRes.Result != ZkResult.Ok)
-            {
-                if (setResourcesRes.Result == ZkResult.BadVersion)
-                    return RebalancingResult.NotCoordinator;
-                if (setResourcesRes.Result == ZkResult.SessionExpired)
-                    return RebalancingResult.SessionExpired;
-
-                return RebalancingResult.Failure;
-            }
+            this.resourcesVersion = await this.zooKeeperService.SetResourcesAsync(resources);
             
-            this.resourcesVersion = setResourcesRes.Data;
+            if (rebalancingToken.IsCancellationRequested) 
+                return RebalancingResult.Cancelled;
             
-            logger.Info(this.clientId, "Coordinator - PHASE 3 - Remove any existing barriers, place new resource barriers and invoke start actions");
-            var leaderAssignments = resourceAssignments.Where(x => x.ClientId == this.clientId).ToList();
-            var currAssignmentRes = this.store.GetResources();
-            InvokeOnStopActions();
+            await this.store.InvokeOnStopActionsAsync(this.clientId, "Coordinator");
+            if (rebalancingToken.IsCancellationRequested) 
+                return RebalancingResult.Cancelled;
             
-            foreach (var resource in currAssignmentRes.Resources)
-            {
-                var removeBarrierRes = await this.zooKeeperService.RemoveResourceBarrierAsync(resource);
-                if(removeBarrierRes != ZkResult.Ok)
-                    return RebalancingResult.Failure;
-            }
-
-            foreach (var newResource in leaderAssignments)
-            {
-                var barrierAdded = await TryPutResourceBarrierAsync(newResource.Resource, sw, rebalancingToken);
-                if (!barrierAdded)
-                {
-                    if (rebalancingToken.IsCancellationRequested)
-                        return RebalancingResult.Cancelled;
-                    if (sw.Elapsed > this.rebalancingTimeLimit)
-                        return RebalancingResult.TimeLimitExceeded;
-                }
-            }
-            
-            this.store.SetResources(new SetResourcesRequest()
-            {
-                AssignmentStatus = AssignmentStatus.ResourcesAssigned, 
-                Resources = leaderAssignments.Select(x => x.Resource).ToList()
-            });
-            InvokeOnStartActions(leaderAssignments.Select(x => x.Resource).ToList());
+            var leaderAssignments = resourceAssignments
+                    .Where(x => x.ClientId == this.clientId)
+                    .Select(x => x.Resource)
+                    .ToList();
+            await this.store.InvokeOnStartActionsAsync(this.clientId, "Coordinator", leaderAssignments, rebalancingToken, this.coordinatorToken);
+            if (rebalancingToken.IsCancellationRequested) 
+                return RebalancingResult.Cancelled;
             
             return RebalancingResult.Complete;
-        }
-
-        private async Task<bool> TryPutResourceBarrierAsync(string resource, Stopwatch sw, CancellationToken token)
-        {
-            while (!token.IsCancellationRequested && sw.Elapsed < this.rebalancingTimeLimit)
-            {
-                var putBarrierRes = await this.zooKeeperService.TryPutResourceBarrierAsync(resource);
-                if (putBarrierRes == ZkResult.Ok)
-                    return true;
-
-                if (putBarrierRes == ZkResult.NodeAlreadyExists)
-                {
-                    await WaitFor(1000, token);
-                    continue;
-                }
-
-                return false;
-            }
-
-            return false;
         }
 
         private string GetClientId(string clientPath)
@@ -366,16 +365,38 @@ namespace Rebalanser.ZooKeeper.ResourceBarrier
             return clientPath.Substring(clientPath.LastIndexOf("/", StringComparison.Ordinal)+1);
         }
         
-        private void InvokeOnStopActions()
-        {
-            foreach(var onStopAction in this.onChangeActions.OnStopActions)
-                onStopAction.Invoke();
-        }
-        
-        private void InvokeOnStartActions(List<string> assignedResources)
-        {
-            foreach(var onStartAction in this.onChangeActions.OnStartActions)
-                onStartAction.Invoke(assignedResources);
-        }
+//        private async Task<bool> TryPutResourceBarrierAsync(string resource, Stopwatch sw, CancellationToken token)
+//        {
+//            var cts = new CancellationTokenSource();
+//            var t = Task.Run(async () => await this.zooKeeperService.TryPutResourceBarrierAsync(resource, cts.Token));
+//            while (!token.IsCancellationRequested)
+//            {
+//                if (t.IsCompleted)
+//                {
+//                    try
+//                    {
+//                        await t;
+//                        return true;
+//                    }
+//                    catch (Exception e)
+//                    {
+//                        this.logger.Error("Failed to put resource barrier", e);
+//                        return false;
+//                    }
+//                }
+//                else
+//                {
+//                    if (sw.Elapsed > this.rebalancingTimeLimit)
+//                    {
+//                        cts.Cancel();
+//                        return false;
+//                    }
+//
+//                    await WaitFor(100);
+//                }
+//            }
+//
+//            return false;
+//        }
     }
 }

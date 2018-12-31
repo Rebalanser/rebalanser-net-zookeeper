@@ -15,6 +15,7 @@ namespace Rebalanser.ZooKeeper.Tests.RandomisedTests
     public class RandomisedResourceBarrierTests : IDisposable
     {
         private ZkHelper zkHelper;
+        private RandomConfig currentConfig;
 
         public RandomisedResourceBarrierTests()
         {
@@ -22,103 +23,137 @@ namespace Rebalanser.ZooKeeper.Tests.RandomisedTests
         }
 
         [Fact]
-        public async Task RandomisedReleaseBarrierTest_ThreeClientsSixResources()
+        public async Task RandomisedReleaseBarrierTest_LongInterval_LowClient_LowResource_FullCheck()
         {
-            // ARRANGE
-            var groupName = Guid.NewGuid().ToString();
-            await this.zkHelper.InitializeAsync("localhost:2181", "/rebalanser", TimeSpan.FromSeconds(20));
-            await this.zkHelper.PrepareResourceGroupAsync(groupName, "res", 6);
-            
-            var resourceMonitor = new ResourceMonitor();
-            List<int> resSuffixes = new List<int>();
-            for (int i = 0; i < 6; i++)
+            var config = new RandomConfig()
             {
-                resourceMonitor.CreateResource($"res{i}");
-                resSuffixes.Add(i);
-            }
-             
-            Providers.Register(GetProvider);
-            
-
-            var clientOptions = new ClientOptions()
-            {
-                AutoRecoveryOnError = true, 
-                RestartDelay = TimeSpan.FromSeconds(10)
+                ClientCount = 3,
+                ResourceCount = 6,
+                TestDuration = TimeSpan.FromMinutes(120),
+                MaxInterval = TimeSpan.FromSeconds(60),
+                RandomiseInterval = false,
+                CheckType = CheckType.FullCheck
             };
             
-            var clients = new List<TestClient>();
-            clients.Add(new TestClient(resourceMonitor, groupName, clientOptions));
-            clients.Add(new TestClient(resourceMonitor, groupName, clientOptions));
-            clients.Add(new TestClient(resourceMonitor, groupName, clientOptions));
-            
-            await clients[0].StartAsync();
-            await clients[1].StartAsync();
-            await clients[2].StartAsync();
-            
-            // ACT
-            var sw = new Stopwatch();
-            sw.Start();
-            var rand = new Random(Guid.NewGuid().GetHashCode());
-            while (sw.Elapsed < TimeSpan.FromMinutes(120))
-            {
-                var action = rand.Next(2);
-                if (action == 0)
-                {
-                    var clientIndex = rand.Next(3);
-                    await clients[clientIndex].PerformActionAsync();
-                }
-                else
-                {
-                    var resAction = rand.Next(2);
-                    if (resAction == 0 && resSuffixes.Count > 1)
-                    {
-                        var resSuffix = resSuffixes.Max() + 1;
-                        resSuffixes.Add(resSuffix);
-                        resourceMonitor.AddResource($"res{resSuffix}");
-                        await this.zkHelper.AddResourceAsync(groupName, $"res{resSuffix}");
-                    }
-                    else
-                    {
-                        var index = rand.Next(resSuffixes.Count);
-                        var resSuffix = resSuffixes[index];
-                        resSuffixes.RemoveAt(index);
-                        resourceMonitor.RemoveResource($"res{resSuffix}");
-                        await this.zkHelper.DeleteResourceAsync(groupName, $"res{resSuffix}");
-                    }
-                }
+            await RandomisedReleaseBarrierTest(config);
+        }
 
-                await Task.Delay(TimeSpan.FromSeconds(60));
-                resourceMonitor.PrintEvents($"/home/jack/tmp/rebalanser-zk/test-{groupName}");
-                Assert.False(resourceMonitor.ViolationsExist());
-                if(clients.Any(x => x.Started))
-                    Assert.True(resourceMonitor.AllResourcesAssigned());
-            }
+        [Fact]
+        public async Task RandomisedReleaseBarrierTest_LongInterval_MediumClient_MediumResource_FullCheck()
+        {
+            var config = new RandomConfig()
+            {
+                ClientCount = 10,
+                ResourceCount = 60,
+                TestDuration = TimeSpan.FromMinutes(120),
+                MaxInterval = TimeSpan.FromSeconds(60),
+                RandomiseInterval = false,
+                CheckType = CheckType.FullCheck
+            };
             
-            // ASSERT
-            Assert.True(true); // if we got here then no errors occurred
-            await clients[0].StopAsync();
-            await clients[1].StopAsync();
-            await clients[2].StopAsync();
+            await RandomisedReleaseBarrierTest(config);
         }
         
         [Fact]
-        public async Task RandomisedReleaseBarrierTest_ThirtyClientsSixtyResources()
+        public async Task RandomisedReleaseBarrierTest_LongInterval_LargeClient_LargeResource_FullCheck()
+        {
+            var config = new RandomConfig()
+            {
+                ClientCount = 30,
+                ResourceCount = 200,
+                TestDuration = TimeSpan.FromMinutes(120),
+                MaxInterval = TimeSpan.FromMinutes(5),
+                RandomiseInterval = false,
+                CheckType = CheckType.FullCheck,
+                StartUpClientInterval = TimeSpan.FromSeconds(2),
+                MinimumRebalancingInterval = TimeSpan.FromMinutes(2),
+                ConnectTimeout = TimeSpan.FromMinutes(1),
+                SessionTimeout = TimeSpan.FromMinutes(1)
+            };
+            
+            await RandomisedReleaseBarrierTest(config);
+        }
+        
+        [Fact]
+        public async Task RandomisedReleaseBarrierTest_LongInterval_SmallClient_LargeResource_FullCheck()
+        {
+            var config = new RandomConfig()
+            {
+                ClientCount = 10,
+                ResourceCount = 200,
+                TestDuration = TimeSpan.FromMinutes(120),
+                MaxInterval = TimeSpan.FromMinutes(5),
+                RandomiseInterval = false,
+                CheckType = CheckType.FullCheck,
+                StartUpClientInterval = TimeSpan.FromSeconds(2),
+                MinimumRebalancingInterval = TimeSpan.FromMinutes(2),
+                ConnectTimeout = TimeSpan.FromMinutes(1),
+                SessionTimeout = TimeSpan.FromMinutes(1)
+            };
+            
+            await RandomisedReleaseBarrierTest(config);
+        }
+        
+        [Fact]
+        public async Task RandomisedReleaseBarrierTest_ShortRandomInterval_MediumClient_MediumResource_ConditionalCheck()
+        {
+            // the wait period is set quite high as running the test long enough
+            // can induce a scenario similar to:
+            // a very short interval causes an in progress rebalancing to cancel
+            // once cancelled the new rebalancing commences, then during this new rebalancing,
+            // a session expired event happens towards the end causing the cancellation of the current
+            // rebalancing, this rebalancing #3 is still in progress 60 seconds after the
+            // the sub second wait period, causing the "all resources assigned" check to fail
+            
+            var config = new RandomConfig()
+            {
+                ClientCount = 10,
+                ResourceCount = 60,
+                TestDuration = TimeSpan.FromMinutes(120),
+                MaxInterval = TimeSpan.FromSeconds(10),
+                RandomiseInterval = true,
+                CheckType = CheckType.ConditionalCheck,
+                ConditionalCheckInterval = 5,
+                ConditionalCheckWaitPeriod = TimeSpan.FromMinutes(2)
+            };
+            
+            await RandomisedReleaseBarrierTest(config);
+        }
+        
+        [Fact]
+        public async Task RandomisedReleaseBarrierTest_ShortInterval_LowClient_LowResource_DoubleAssignmentCheck()
+        {
+            var config = new RandomConfig()
+            {
+                ClientCount = 3,
+                ResourceCount = 6,
+                TestDuration = TimeSpan.FromMinutes(120),
+                MaxInterval = TimeSpan.FromSeconds(5),
+                RandomiseInterval = false,
+                CheckType = CheckType.DoubleAssignmentCheck
+            };
+            
+            await RandomisedReleaseBarrierTest(config);
+        }
+
+        private async Task RandomisedReleaseBarrierTest(RandomConfig config)
         {
             // ARRANGE
+            var testLogger = new TestOutputLogger();
             var groupName = Guid.NewGuid().ToString();
-            await this.zkHelper.InitializeAsync("localhost:2181", "/rebalanser", TimeSpan.FromSeconds(20));
-            await this.zkHelper.PrepareResourceGroupAsync(groupName, "res", 60);
+            await this.zkHelper.InitializeAsync("/rebalanser", TimeSpan.FromSeconds(20), TimeSpan.FromSeconds(30));
+            await this.zkHelper.PrepareResourceGroupAsync(groupName, "res", config.ResourceCount);
             
             var resourceMonitor = new ResourceMonitor();
             List<int> resSuffixes = new List<int>();
-            for (int i = 0; i < 60; i++)
+            for (int i = 0; i < config.ResourceCount; i++)
             {
                 resourceMonitor.CreateResource($"res{i}");
                 resSuffixes.Add(i);
             }
-             
+
+            this.currentConfig = config;
             Providers.Register(GetProvider);
-            
 
             var clientOptions = new ClientOptions()
             {
@@ -127,11 +162,16 @@ namespace Rebalanser.ZooKeeper.Tests.RandomisedTests
             };
             
             var clients = new List<TestClient>();
-            for (int i = 0; i < 30; i++)
+            for (int i = 0; i < config.ClientCount; i++)
                 clients.Add(new TestClient(resourceMonitor, groupName, clientOptions));
-            
-            for (int i = 0; i < 30; i++)
+
+            for (int i = 0; i < config.ClientCount; i++)
+            {
+                if (config.StartUpClientInterval.TotalMilliseconds > 0)
+                    await Task.Delay(config.StartUpClientInterval);
+                
                 await clients[i].StartAsync();
+            }
 
             await Task.Delay(TimeSpan.FromSeconds(30));
             
@@ -139,23 +179,32 @@ namespace Rebalanser.ZooKeeper.Tests.RandomisedTests
             var sw = new Stopwatch();
             sw.Start();
             var rand = new Random(Guid.NewGuid().GetHashCode());
-            while (sw.Elapsed < TimeSpan.FromMinutes(120))
+            int testCounter = 0;
+            while (sw.Elapsed < config.TestDuration)
             {
+                testLogger.Info("TEST RUNNER", "Test " + testCounter);
+                
+                // action == 0 -> add/remove a client
+                // action == 1 -> add/remove a resource
                 var action = rand.Next(2);
                 if (action == 0)
                 {
-                    var clientIndex = rand.Next(30);
-                    await clients[clientIndex].PerformActionAsync();
+                    var clientIndex = rand.Next(config.ClientCount);
+                    await clients[clientIndex].PerformActionAsync(testLogger);
                 }
                 else
                 {
+                    // resAction == 0 && resources exist -> remove a resource
+                    // else add a resource
                     var resAction = rand.Next(2);
-                    if (resAction == 0 && resSuffixes.Count > 1)
+                    if (resAction == 0 || !resSuffixes.Any())
                     {
-                        var resSuffix = resSuffixes.Max() + 1;
+                        var resSuffix = resSuffixes.Any() ? resSuffixes.Max() + 1 : 0;
                         resSuffixes.Add(resSuffix);
                         resourceMonitor.AddResource($"res{resSuffix}");
+                        testLogger.Info("TEST RUNNER", "Adding a resource");
                         await this.zkHelper.AddResourceAsync(groupName, $"res{resSuffix}");
+                        testLogger.Info("TEST RUNNER", "Added a resource");
                     }
                     else
                     {
@@ -163,32 +212,72 @@ namespace Rebalanser.ZooKeeper.Tests.RandomisedTests
                         var resSuffix = resSuffixes[index];
                         resSuffixes.RemoveAt(index);
                         resourceMonitor.RemoveResource($"res{resSuffix}");
+                        testLogger.Info("TEST RUNNER", "Removing a resource");
                         await this.zkHelper.DeleteResourceAsync(groupName, $"res{resSuffix}");
+                        testLogger.Info("TEST RUNNER", "Removed a resource");
                     }
                 }
 
-                await Task.Delay(TimeSpan.FromSeconds(60));
+                // wait for the configured period of time before making asserts
+                // this gives the necessary time for rebalancing
+                TimeSpan currentTestInterval;
+                if (config.RandomiseInterval)
+                    currentTestInterval = TimeSpan.FromMilliseconds(rand.Next((int) config.MaxInterval.TotalMilliseconds));
+                else
+                    currentTestInterval = config.MaxInterval;
+                await Task.Delay(currentTestInterval);
+                
                 resourceMonitor.PrintEvents($"/home/jack/tmp/rebalanser-zk/test-{groupName}");
-                Assert.False(resourceMonitor.ViolationsExist());
-                if(clients.Any(x => x.Started))
-                    Assert.True(resourceMonitor.AllResourcesAssigned());
+                
+                // check for double assignments. All test scenarios must check this. No matter
+                // what happens, we can never allow double assignments - ever
+                if (resourceMonitor.DoubleAssignmentsExist())
+                {
+                    foreach (var violation in resourceMonitor.GetDoubleAssignments())
+                        testLogger.Error("TEST RUNNER", violation.ToString());
+                }
+                Assert.False(resourceMonitor.DoubleAssignmentsExist());
+                
+                // depending on the type of test, we'll ensure that all resources have been assigned
+                // some tests that have extremely short durations between events do not leave enough time
+                // for rebalancing and so do not perform this check. The conditional check will
+                // only perform this check when a long enough time period has been allowed for rebalancing to complete
+                if (config.CheckType == CheckType.FullCheck)
+                {
+                    if (clients.Any(x => x.Started))
+                    {
+                        testLogger.Info("TEST RUNNER", "Perform all resources assigned check");
+                        Assert.True(resourceMonitor.AllResourcesAssigned());
+                    }
+                }
+                else if (config.CheckType == CheckType.ConditionalCheck)
+                {
+                    if (testCounter % config.ConditionalCheckInterval == 0 && clients.Any(x => x.Started))
+                    {
+                        testLogger.Info("TEST RUNNER", "Grace period before all resources assigned check");
+                        await Task.Delay(config.ConditionalCheckWaitPeriod);
+                        testLogger.Info("TEST RUNNER", "Perform all resources assigned check");
+                        Assert.True(resourceMonitor.AllResourcesAssigned());
+                    }
+                }
+
+                testCounter++;
             }
             
-            // ASSERT
-            Assert.True(true); // if we got here then no errors occurred
-            await clients[0].StopAsync();
-            await clients[1].StopAsync();
-            await clients[2].StopAsync();
+            // clean up
+            for (int i = 0; i < config.ClientCount; i++)
+                await clients[i].StopAsync();
         }
         
         private IRebalanserProvider GetProvider()
         {
-            return new ZooKeeperProvider("localhost:2181", 
+            return new ZooKeeperProvider(ZkHelper.ZooKeeperHosts, 
                 "/rebalanser", 
-                TimeSpan.FromSeconds(20),
-                TimeSpan.FromSeconds(20),
+                this.currentConfig.SessionTimeout,    
+                this.currentConfig.ConnectTimeout,
+                this.currentConfig.MinimumRebalancingInterval,
                 RebalancingMode.ResourceBarrier,
-                new ConsoleLogger());
+                new TestOutputLogger());
         }
         
         public void Dispose()

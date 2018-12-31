@@ -150,6 +150,7 @@ namespace ZkTester
                 "/rebalanser", 
                 TimeSpan.FromSeconds(20),
                 TimeSpan.FromSeconds(20),
+                TimeSpan.FromSeconds(20),
                 RebalancingMode.ResourceBarrier,
                 new ConsoleLogger());
         }

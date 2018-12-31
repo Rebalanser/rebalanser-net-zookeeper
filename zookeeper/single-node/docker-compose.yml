@@ -1,0 +1,30 @@
+version: '2.1'
+
+services:
+  zk1:
+    image: zookeeper:3.4.9
+    hostname: zk1
+    ports:
+      - "2181:2181"
+    environment:
+        ZOO_MY_ID: 1
+        ZOO_PORT: 2181
+        ZOO_SERVERS: server.1=0.0.0.0:2888:3888
+  web:
+      image: elkozmon/zoonavigator-web:0.5.0
+      container_name: zoonavigator-web
+      ports:
+      - "8000:8000"
+      environment:
+        WEB_HTTP_PORT: 8000
+        API_HOST: "api"
+        API_PORT: 9000
+      depends_on:
+      - api
+      restart: always
+  api:
+    image: elkozmon/zoonavigator-api:0.5.0
+    container_name: zoonavigator-api
+    environment:
+      API_HTTP_PORT: 9000
+    restart: always

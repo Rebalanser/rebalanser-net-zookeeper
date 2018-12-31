@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using Newtonsoft.Json;
 using org.apache.zookeeper;
@@ -12,7 +13,6 @@ namespace Rebalanser.ZooKeeper.Zk
     public class ZooKeeperService : Watcher, IZooKeeperService
     {
         private org.apache.zookeeper.ZooKeeper zookeeper;
-        private ILogger logger;
         private string zookeeperHosts;
         private string clientsPath;
         private string statusPath;
@@ -20,16 +20,16 @@ namespace Rebalanser.ZooKeeper.Zk
         private string resourcesPath;
         private string epochPath;
         private Event.KeeperState keeperState;
+        private CancellationToken token;
         private string clientId;
 
-        public ZooKeeperService(string zookeeperHosts, ILogger logger)
+        public ZooKeeperService(string zookeeperHosts)
         {
             this.zookeeperHosts = zookeeperHosts;
-            this.logger = logger;
-            this.clientId = "Pending Id";
+            this.clientId = "-";
         }
         
-        public async Task<bool> InitializeGlobalBarrierAsync(string clientsPath,
+        public async Task InitializeGlobalBarrierAsync(string clientsPath,
             string statusPath,
             string stoppedPath,
             string resourcesPath,
@@ -41,45 +41,14 @@ namespace Rebalanser.ZooKeeper.Zk
             this.resourcesPath = resourcesPath;
             this.epochPath = epochPath;
 
-            var clientsPathRes = await EnsurePathAsync(this.clientsPath);
-            if (clientsPathRes != ZkResult.Ok)
-            {
-                this.logger.Error(this.clientId, $"znode {this.clientsPath} does not exist and could not be created");
-                return false;
-            }
-            
-            var epochPathRes = await EnsurePathAsync(this.epochPath);
-            if (epochPathRes != ZkResult.Ok)
-            {
-                this.logger.Error(this.clientId, $"znode {this.epochPath} does not exist and could not be created");
-                return false;
-            }
-            
-            var statusPathRes = await EnsurePathAsync(this.statusPath);
-            if (statusPathRes != ZkResult.Ok)
-            {
-                this.logger.Error(this.clientId, $"znode {this.statusPath} does not exist and could not be created");
-                return false;
-            }
-            
-            var stoppedPathRes = await EnsurePathAsync(this.stoppedPath);
-            if (stoppedPathRes != ZkResult.Ok)
-            {
-                this.logger.Error(this.clientId, $"znode {this.stoppedPath} does not exist and could not be created");
-                return false;
-            }
-            
-            var resourcesPathRes = await EnsurePathAsync(this.resourcesPath);
-            if (resourcesPathRes != ZkResult.Ok)
-            {
-                this.logger.Error(this.clientId, $"znode {this.resourcesPath} does not exist and could not be created");
-                return false;
-            }
-
-            return true;
+            await EnsurePathAsync(this.clientsPath);
+            await EnsurePathAsync(this.epochPath);
+            await EnsurePathAsync(this.statusPath);
+            await EnsurePathAsync(this.stoppedPath);
+            await EnsurePathAsync(this.resourcesPath);
         }
         
-        public async Task<bool> InitializeResourceBarrierAsync(string clientsPath,
+        public async Task InitializeResourceBarrierAsync(string clientsPath,
             string resourcesPath,
             string epochPath)
         {
@@ -87,28 +56,9 @@ namespace Rebalanser.ZooKeeper.Zk
             this.resourcesPath = resourcesPath;
             this.epochPath = epochPath;
 
-            var clientsPathRes = await EnsurePathAsync(this.clientsPath);
-            if (clientsPathRes != ZkResult.Ok)
-            {
-                this.logger.Error(this.clientId, $"znode {this.clientsPath} does not exist and could not be created");
-                return false;
-            }
-            
-            var epochPathRes = await EnsurePathAsync(this.epochPath);
-            if (epochPathRes != ZkResult.Ok)
-            {
-                this.logger.Error(this.clientId, $"znode {this.epochPath} does not exist and could not be created");
-                return false;
-            }
-            
-            var resourcesPathRes = await EnsurePathAsync(this.resourcesPath);
-            if (resourcesPathRes != ZkResult.Ok)
-            {
-                this.logger.Error(this.clientId, $"znode {this.resourcesPath} does not exist and could not be created");
-                return false;
-            }
-
-            return true;
+            await EnsurePathAsync(this.clientsPath);
+            await EnsurePathAsync(this.epochPath);
+            await EnsurePathAsync(this.resourcesPath);
         }
 
         public Event.KeeperState GetKeeperState()
@@ -116,8 +66,9 @@ namespace Rebalanser.ZooKeeper.Zk
             return this.keeperState;
         }
 
-        public async Task<bool> StartSessionAsync(TimeSpan sessionTimeout, TimeSpan connectTimeout)
+        public async Task<bool> StartSessionAsync(TimeSpan sessionTimeout, TimeSpan connectTimeout, CancellationToken token)
         {
+            this.token = token;
             var sw = new Stopwatch();
             sw.Start();
             
@@ -137,7 +88,8 @@ namespace Rebalanser.ZooKeeper.Zk
 
         public async Task CloseSessionAsync()
         {
-            await this.zookeeper.closeAsync();
+            if(this.zookeeper != null)
+                await this.zookeeper.closeAsync();
             this.zookeeper = null;
         }
 
@@ -147,692 +99,858 @@ namespace Rebalanser.ZooKeeper.Zk
             await Task.Yield();
         }
 
-        public async Task<ZkResponse<string>> CreateClientAsync()
+        public async Task<string> CreateClientAsync()
         {
-            try
+            var actionToPerform = "create client znode";
+            while (true)
             {
-                var clientPath = await this.zookeeper.createAsync(
-                    $"{this.clientsPath}/client_",
-                    System.Text.Encoding.UTF8.GetBytes("0"),
-                    ZooDefs.Ids.OPEN_ACL_UNSAFE,
-                    CreateMode.EPHEMERAL_SEQUENTIAL);
-
-                this.clientId = clientPath.Substring(clientPath.LastIndexOf("/")+1);
-
-                return new ZkResponse<string>(ZkResult.Ok, clientPath);
-            }
-            catch (KeeperException.NoNodeException e)
-            {
-                this.logger.Error(this.clientId, "Could not create client znode as parent node does not exist: " + e);
-                return new ZkResponse<string>(ZkResult.NoZnode);
-            }
-            catch (KeeperException.ConnectionLossException e)
-            {
-                this.logger.Error(this.clientId, "Could not create client znode as the connection has been lost: " + e);
-                return new ZkResponse<string>(ZkResult.ConnectionLost);
-            }
-            catch (KeeperException.SessionExpiredException e)
-            {
-                this.logger.Error(this.clientId, "Could not create client znode as the session has expired: " + e);
-                return new ZkResponse<string>(ZkResult.SessionExpired);
-            }
-            catch (Exception e)
-            {
-                this.logger.Error(this.clientId, "Could not create client znode: " + e);
-                return new ZkResponse<string>(ZkResult.UnexpectedError);
-            }
-        }
-
-        public async Task<ZkResult> DeleteClientAsync(string clientPath)
-        {
-            try
-            {
-                await this.zookeeper.deleteAsync(clientPath);
-                return ZkResult.Ok;
-            }
-            catch (KeeperException.NoNodeException e)
-            {
-                this.logger.Error(this.clientId, "Could not delete client znode as the node does not exist: " + e);
-                return ZkResult.NoZnode;
-            }
-            catch (KeeperException.ConnectionLossException e)
-            {
-                this.logger.Error(this.clientId, "Could not delete client znode as the connection has been lost: " + e);
-                return ZkResult.ConnectionLost;
-            }
-            catch (KeeperException.SessionExpiredException e)
-            {
-                this.logger.Error(this.clientId, "Could not delete client znode as the session has expired: " + e);
-                return ZkResult.SessionExpired;
-            }
-            catch (Exception e)
-            {
-                this.logger.Error(this.clientId, "Could not create client znode: " + e);
-                return ZkResult.UnexpectedError;
-            }
-        }
-
-        public async Task<ZkResult> EnsurePathAsync(string znodePath)
-        {
-            try
-            {
-                var znodeStat = await this.zookeeper.existsAsync(znodePath);
-                if (znodeStat == null)
+                await BlockUntilConnected(actionToPerform);
+                
+                try
                 {
-                    await this.zookeeper.createAsync(znodePath,
+                    var clientPath = await this.zookeeper.createAsync(
+                        $"{this.clientsPath}/client_",
                         System.Text.Encoding.UTF8.GetBytes("0"),
                         ZooDefs.Ids.OPEN_ACL_UNSAFE,
-                        CreateMode.PERSISTENT);
+                        CreateMode.EPHEMERAL_SEQUENTIAL);
+
+                    this.clientId = clientPath.Substring(clientPath.LastIndexOf("/") + 1);
+
+                    return clientPath;
                 }
-
-                return ZkResult.Ok;
-            }
-            catch (KeeperException.NodeExistsException)
-            {
-                return ZkResult.Ok;
-            }
-            catch (KeeperException.ConnectionLossException e)
-            {
-                this.logger.Error(this.clientId, $"Could not create znode {znodePath} as the connection has been lost: " + e);
-                return ZkResult.ConnectionLost;
-            }
-            catch (KeeperException.SessionExpiredException e)
-            {
-                this.logger.Error(this.clientId, $"Could not create znode {znodePath} as the session has expired: " + e);
-                return ZkResult.SessionExpired;
-            }
-            catch (Exception e)
-            {
-                this.logger.Error(this.clientId, $"Could not create znode {znodePath}: " + e);
-                return ZkResult.UnexpectedError;
-            }
-            //
-        }
-        
-        public async Task<ZkResponse<int>> IncrementEpochAsync(int currentEpoch)
-        {
-            try
-            {
-                var data = System.Text.Encoding.UTF8.GetBytes("0");
-                var stat = await zookeeper.setDataAsync(this.epochPath, data, currentEpoch);
-                return new ZkResponse<int>(ZkResult.Ok, stat.getVersion());
-            }
-            catch (KeeperException.BadVersionException e)
-            {
-                this.logger.Error(this.clientId, "Could not increment epoch as the current epoch was incremented already. Stale epoch: " + e);
-                return new ZkResponse<int>(ZkResult.BadVersion);
-            }
-            catch (KeeperException.NoNodeException e)
-            {
-                this.logger.Error(this.clientId, "Could not increment epoch as the node does not exist: " + e);
-                return new ZkResponse<int>(ZkResult.NoZnode);
-            }
-            catch (KeeperException.ConnectionLossException e)
-            {
-                this.logger.Error(this.clientId, "Could not increment epoch as the connection has been lost: " + e);
-                return new ZkResponse<int>(ZkResult.ConnectionLost);
-            }
-            catch (KeeperException.SessionExpiredException e)
-            {
-                this.logger.Error(this.clientId, "Could not increment epoch as the session has expired: " + e);
-                return new ZkResponse<int>(ZkResult.SessionExpired);
-            }
-            catch (Exception e)
-            {
-                this.logger.Error(this.clientId, "Could not increment epoch: " + e);
-                return new ZkResponse<int>(ZkResult.UnexpectedError);
-            }
-        }
-        
-        public async Task<ZkResponse<int>> GetEpochAsync()
-        {
-            try
-            {
-                var dataResult = await zookeeper.getDataAsync(this.epochPath);
-                return new ZkResponse<int>(ZkResult.Ok, dataResult.Stat.getVersion());
-            }
-            catch (KeeperException.NoNodeException e)
-            {
-                this.logger.Error(this.clientId, "Could not get the current epoch as the node does not exist: " + e);
-                return new ZkResponse<int>(ZkResult.NoZnode);
-            }
-            catch (KeeperException.ConnectionLossException e)
-            {
-                this.logger.Error(this.clientId, "Could not get the current epoch as the connection has been lost: " + e);
-                return new ZkResponse<int>(ZkResult.ConnectionLost);
-            }
-            catch (KeeperException.SessionExpiredException e)
-            {
-                this.logger.Error(this.clientId, "Could not get the current epoch as the session has expired: " + e);
-                return new ZkResponse<int>(ZkResult.SessionExpired);
-            }
-            catch (Exception e)
-            {
-                this.logger.Error(this.clientId, "Could not get the current epoch: " + e);
-                return new ZkResponse<int>(ZkResult.UnexpectedError);
-            }
-        }
-
-        public async Task<ZkResponse<ClientsZnode>> GetActiveClientsAsync()
-        {
-            try
-            {
-                var childrenResult = await this.zookeeper.getChildrenAsync(this.clientsPath);
-                var childrenPaths = childrenResult.Children.Select(x => $"{this.clientsPath}/{x}").ToList();
-                return new ZkResponse<ClientsZnode>(ZkResult.Ok, new ClientsZnode()
+                catch (KeeperException.NoNodeException e)
                 {
-                    Version = childrenResult.Stat.getVersion(),
-                    ClientPaths = childrenPaths
-                });
-            }
-            catch (KeeperException.NoNodeException e)
-            {
-                this.logger.Error(this.clientId, "Could not get children as the node does not exist: " + e);
-                return new ZkResponse<ClientsZnode>(ZkResult.NoZnode);
-            }
-            catch (KeeperException.ConnectionLossException e)
-            {
-                this.logger.Error(this.clientId, "Could not get children as the connection has been lost: " + e);
-                return new ZkResponse<ClientsZnode>(ZkResult.ConnectionLost);
-            }
-            catch (KeeperException.SessionExpiredException e)
-            {
-                this.logger.Error(this.clientId, "Could not get children epoch as the session has expired: " + e);
-                return new ZkResponse<ClientsZnode>(ZkResult.SessionExpired);
-            }
-            catch (Exception e)
-            {
-                this.logger.Error(this.clientId, "Could not get children: " + e);
-                return new ZkResponse<ClientsZnode>(ZkResult.UnexpectedError);
-            }
-        }
-
-        public async Task<ZkResponse<StatusZnode>> GetStatusAsync()
-        {
-            try
-            {
-                var dataResult = await zookeeper.getDataAsync(this.statusPath);
-                var status = RebalancingStatus.NotSet;
-                if (dataResult.Stat.getDataLength() > 0)
-                    status = (RebalancingStatus) BitConverter.ToInt32(dataResult.Data, 0);
-                        
-                return new ZkResponse<StatusZnode>(ZkResult.Ok, new StatusZnode()
+                    throw new ZkInvalidOperationException($"Could not {actionToPerform} as parent node does not exist", e);
+                }
+                catch (KeeperException.ConnectionLossException)
                 {
-                    RebalancingStatus = status,
-                    Version = dataResult.Stat.getVersion()
-                });
-            }
-            catch (KeeperException.NoNodeException e)
-            {
-                this.logger.Error(this.clientId, "Could not get status as the node does not exist: " + e);
-                return new ZkResponse<StatusZnode>(ZkResult.NoZnode);
-            }
-            catch (KeeperException.ConnectionLossException e)
-            {
-                this.logger.Error(this.clientId, "Could not get status as the connection has been lost: " + e);
-                return new ZkResponse<StatusZnode>(ZkResult.ConnectionLost);
-            }
-            catch (KeeperException.SessionExpiredException e)
-            {
-                this.logger.Error(this.clientId, "Could not get status epoch as the session has expired: " + e);
-                return new ZkResponse<StatusZnode>(ZkResult.SessionExpired);
-            }
-            catch (Exception e)
-            {
-                this.logger.Error(this.clientId, "Could not get status: " + e);
-                return new ZkResponse<StatusZnode>(ZkResult.UnexpectedError);
+                    // do nothing, the next iteration will try again
+                }
+                catch (KeeperException.SessionExpiredException e)
+                {
+                    throw new ZkSessionExpiredException($"Could not {actionToPerform} as the session has expired: ", e);
+                }
+                catch (Exception e)
+                {
+                    throw new ZkInvalidOperationException($"Could not {actionToPerform} due to an unexpected error", e);
+                }
             }
         }
 
-        public async Task<ZkResponse<int>> SetStatus(StatusZnode statusZnode)
+        public async Task DeleteClientAsync(string clientPath)
         {
-            try
+            var actionToPerform = "delete client znode";
+            bool succeeded = false;
+            while (!succeeded)
             {
-                var data = BitConverter.GetBytes((int) statusZnode.RebalancingStatus);
-                var stat = await zookeeper.setDataAsync(this.statusPath, data, statusZnode.Version);
-                return new ZkResponse<int>(ZkResult.Ok, stat.getVersion());
-            }
-            catch (KeeperException.BadVersionException e)
-            {
-                this.logger.Error(this.clientId, "Could not set status due to a bad version number. " + e);
-                return new ZkResponse<int>(ZkResult.BadVersion);
-            }
-            catch (KeeperException.NoNodeException e)
-            {
-                this.logger.Error(this.clientId, "Could not set status as the node does not exist: " + e);
-                return new ZkResponse<int>(ZkResult.NoZnode);
-            }
-            catch (KeeperException.ConnectionLossException e)
-            {
-                this.logger.Error(this.clientId, "Could not set status as the connection has been lost: " + e);
-                return new ZkResponse<int>(ZkResult.ConnectionLost);
-            }
-            catch (KeeperException.SessionExpiredException e)
-            {
-                this.logger.Error(this.clientId, "Could not set status as the session has expired: " + e);
-                return new ZkResponse<int>(ZkResult.SessionExpired);
-            }
-            catch (Exception e)
-            {
-                this.logger.Error(this.clientId, "Could not set status: " + e);
-                return new ZkResponse<int>(ZkResult.UnexpectedError);
+                await BlockUntilConnected(actionToPerform);
+
+                try
+                {
+                    await this.zookeeper.deleteAsync(clientPath);
+                    succeeded = true;
+                }
+                catch (KeeperException.NoNodeException e)
+                {
+                    throw new ZkInvalidOperationException($"Could not {actionToPerform} as the node does not exist.", e);
+                }
+                catch (KeeperException.ConnectionLossException)
+                {
+                    // do nothing, will try again in the next iteration
+                }
+                catch (KeeperException.SessionExpiredException e)
+                {
+                    throw new ZkSessionExpiredException($"Could not {actionToPerform} as the session has expired.", e);
+                }
+                catch (Exception e)
+                {
+                    throw new ZkInvalidOperationException($"Could not {actionToPerform} due to an unexpected error", e);
+                }
             }
         }
 
-        public async Task<ZkResult> SetFollowerAsStopped(string clientId)
+        public async Task EnsurePathAsync(string znodePath)
         {
-            try
+            var actionToPerform = $"ensure path {znodePath}";
+            bool succeeded = false;
+            while (!succeeded)
             {
-                await this.zookeeper.createAsync(
-                    $"{this.stoppedPath}/{clientId}",
-                    System.Text.Encoding.UTF8.GetBytes("0"),
-                    ZooDefs.Ids.OPEN_ACL_UNSAFE,
-                    CreateMode.EPHEMERAL);
-                return ZkResult.Ok;
-            }
-            catch (KeeperException.NodeExistsException)
-            {
-                return ZkResult.NodeAlreadyExists;
-            }
-            catch (KeeperException.NoNodeException e)
-            {
-                this.logger.Error(this.clientId, "Could not add follower to the stopped list as the stopped node does not exist: " +
-                                  e);
-                return ZkResult.NoZnode;
-            }
-            catch (KeeperException.ConnectionLossException e)
-            {
-                this.logger.Error(this.clientId, "Could not add follower to the stopped list as the connection has been lost: " + e);
-                return ZkResult.ConnectionLost;
-            }
-            catch (KeeperException.SessionExpiredException e)
-            {
-                this.logger.Error(this.clientId, "Could not add follower to the stopped list as the session has expired: " + e);
-                return ZkResult.SessionExpired;
-            }
-            catch (Exception e)
-            {
-                this.logger.Error(this.clientId, "Could not add follower to the stopped list: " + e);
-                return ZkResult.UnexpectedError;
+                await BlockUntilConnected(actionToPerform);
+
+                try
+                {
+                    var znodeStat = await this.zookeeper.existsAsync(znodePath);
+                    if (znodeStat == null)
+                    {
+                        await this.zookeeper.createAsync(znodePath,
+                            System.Text.Encoding.UTF8.GetBytes("0"),
+                            ZooDefs.Ids.OPEN_ACL_UNSAFE,
+                            CreateMode.PERSISTENT);
+                    }
+
+                    succeeded = true;
+                }
+                catch (KeeperException.NodeExistsException)
+                {
+                    succeeded = true; // the node exists which is what we want
+                }
+                catch (KeeperException.ConnectionLossException)
+                {
+                    // do nothing, will try again in the next iteration
+                }
+                catch (KeeperException.SessionExpiredException e)
+                {
+                    throw new ZkSessionExpiredException($"Could not {actionToPerform} as the session has expired.", e);
+                }
+                catch (Exception e)
+                {
+                    throw new ZkInvalidOperationException($"Could not {actionToPerform} due to an unexpected error", e);
+                }
             }
         }
         
-        public async Task<ZkResult> SetFollowerAsStarted(string clientId)
+        public async Task<int> IncrementAndWatchEpochAsync(int currentEpoch, Watcher watcher)
         {
-            try
+            var actionToPerform = "increment epoch";
+            while (true)
             {
-                await this.zookeeper.deleteAsync($"{this.stoppedPath}/{clientId}");
-                return ZkResult.Ok;
+                await BlockUntilConnected(actionToPerform);
+
+                try
+                {
+                    var data = System.Text.Encoding.UTF8.GetBytes("0");
+                    var stat = await zookeeper.setDataAsync(this.epochPath, data, currentEpoch);
+                    
+                    var dataRes = await zookeeper.getDataAsync(this.epochPath, watcher);
+                    if (dataRes.Stat.getVersion() == stat.getVersion())
+                        return dataRes.Stat.getVersion();
+                    else
+                        throw new ZkStaleVersionException("Between incrementing the epoch and setting a watch the epoch was incremented");
+                }
+                catch (KeeperException.BadVersionException e)
+                {
+                    throw new ZkStaleVersionException($"Could not {actionToPerform} as the current epoch was incremented already.", e);
+                }
+                catch (KeeperException.NoNodeException e)
+                {
+                    throw new ZkInvalidOperationException($"Could not {actionToPerform} as the node does not exist.", e);
+                }
+                catch (KeeperException.ConnectionLossException)
+                {
+                    // do nothing, the next iteration will try again
+                }
+                catch (KeeperException.SessionExpiredException e)
+                {
+                    throw new ZkSessionExpiredException($"Could not {actionToPerform} as the session has expired: ", e);
+                }
+                catch (Exception e)
+                {
+                    throw new ZkInvalidOperationException($"Could not {actionToPerform} due to an unexpected error", e);
+                }
             }
-            catch (KeeperException.NoNodeException)
+        }
+        
+        public async Task<int> GetEpochAsync()
+        {
+            var actionToPerform = "get the current epoch";
+            while (true)
             {
-                return ZkResult.Ok;
-            }
-            catch (KeeperException.ConnectionLossException e)
-            {
-                this.logger.Error(this.clientId, "Could not remove follower from the stopped list as the connection has been lost: " + e);
-                return ZkResult.ConnectionLost;
-            }
-            catch (KeeperException.SessionExpiredException e)
-            {
-                this.logger.Error(this.clientId, "Could not remove follower from the stopped list as the session has expired: " + e);
-                return ZkResult.SessionExpired;
-            }
-            catch (Exception e)
-            {
-                this.logger.Error(this.clientId, "Could not remove follower from the stopped list: " + e);
-                return ZkResult.UnexpectedError;
+                await BlockUntilConnected(actionToPerform);
+
+                try
+                {
+                    var dataResult = await zookeeper.getDataAsync(this.epochPath);
+                    return dataResult.Stat.getVersion();
+                }
+                catch (KeeperException.NoNodeException e)
+                {
+                    throw new ZkInvalidOperationException($"Could not {actionToPerform} as the node does not exist.", e);
+                }
+                catch (KeeperException.ConnectionLossException)
+                {
+                    // do nothing, the next iteration will try again
+                }
+                catch (KeeperException.SessionExpiredException e)
+                {
+                    throw new ZkSessionExpiredException($"Could not {actionToPerform} as the session has expired: ", e);
+                }
+                catch (Exception e)
+                {
+                    throw new ZkInvalidOperationException($"Could not {actionToPerform} due to an unexpected error", e);
+                }
             }
         }
 
-        public async Task<ZkResponse<ResourcesZnode>> GetResourcesAsync()
+        public async Task<ClientsZnode> GetActiveClientsAsync()
         {
-            try
+            var actionToPerform = "get the list of active clients";
+            while (true)
             {
-                var dataResult = await this.zookeeper.getDataAsync(this.resourcesPath);
-                var childrenResult = await this.zookeeper.getChildrenAsync(this.resourcesPath);
-                var resourcesZnodeData = JsonConvert.DeserializeObject<ResourcesZnodeData>(
+                await BlockUntilConnected(actionToPerform);
+
+                try
+                {
+                    var childrenResult = await this.zookeeper.getChildrenAsync(this.clientsPath);
+                    var childrenPaths = childrenResult.Children.Select(x => $"{this.clientsPath}/{x}").ToList();
+                    return new ClientsZnode()
+                    {
+                        Version = childrenResult.Stat.getVersion(),
+                        ClientPaths = childrenPaths
+                    };
+                }
+                catch (KeeperException.NoNodeException e)
+                {
+                    throw new ZkInvalidOperationException($"Could not {actionToPerform} as the clients node does not exist.", e);
+                }
+                catch (KeeperException.ConnectionLossException)
+                {
+                    // do nothing, the next iteration will try again
+                }
+                catch (KeeperException.SessionExpiredException e)
+                {
+                    throw new ZkSessionExpiredException($"Could not {actionToPerform} as the session has expired: ", e);
+                }
+                catch (Exception e)
+                {
+                    throw new ZkInvalidOperationException($"Could not {actionToPerform} due to an unexpected error", e);
+                }
+            }
+        }
+
+        public async Task<StatusZnode> GetStatusAsync()
+        {
+            var actionToPerform = "get the status znode";
+            while (true)
+            {
+                await BlockUntilConnected(actionToPerform);
+
+                try
+                {
+                    var dataResult = await zookeeper.getDataAsync(this.statusPath);
+                    var status = RebalancingStatus.NotSet;
+                    if (dataResult.Stat.getDataLength() > 0)
+                        status = (RebalancingStatus) BitConverter.ToInt32(dataResult.Data, 0);
+
+                    return new StatusZnode()
+                    {
+                        RebalancingStatus = status,
+                        Version = dataResult.Stat.getVersion()
+                    };
+                }
+                catch (KeeperException.NoNodeException e)
+                {
+                    throw new ZkInvalidOperationException($"Could not {actionToPerform} as the node does not exist.", e);
+                }
+                catch (KeeperException.ConnectionLossException)
+                {
+                    // do nothing, the next iteration will try again
+                }
+                catch (KeeperException.SessionExpiredException e)
+                {
+                    throw new ZkSessionExpiredException($"Could not {actionToPerform} as the session has expired: ", e);
+                }
+                catch (Exception e)
+                {
+                    throw new ZkInvalidOperationException($"Could not {actionToPerform} due to an unexpected error", e);
+                }
+            }
+        }
+
+        public async Task<int> SetStatus(StatusZnode statusZnode)
+        {
+            var actionToPerform = "set the status znode";
+            while (true)
+            {
+                await BlockUntilConnected(actionToPerform);
+
+                try
+                {
+                    var data = BitConverter.GetBytes((int) statusZnode.RebalancingStatus);
+                    var stat = await zookeeper.setDataAsync(this.statusPath, data, statusZnode.Version);
+                    return stat.getVersion();
+                }
+                catch (KeeperException.BadVersionException e)
+                {
+                    throw new ZkStaleVersionException($"Could not {actionToPerform} due to a bad version number.", e);
+                }
+                catch (KeeperException.NoNodeException e)
+                {
+                    throw new ZkInvalidOperationException($"Could not {actionToPerform} as the node does not exist.", e);
+                }
+                catch (KeeperException.ConnectionLossException)
+                {
+                    // do nothing, the next iteration will try again
+                }
+                catch (KeeperException.SessionExpiredException e)
+                {
+                    throw new ZkSessionExpiredException($"Could not {actionToPerform} as the session has expired: ", e);
+                }
+                catch (Exception e)
+                {
+                    throw new ZkInvalidOperationException($"Could not {actionToPerform} due to an unexpected error", e);
+                }
+            }
+        }
+
+        public async Task SetFollowerAsStopped(string clientId)
+        {
+            var actionToPerform = $"set follower {clientId} as stopped";
+            bool succeeded = false;
+            while (!succeeded)
+            {
+                await BlockUntilConnected(actionToPerform);
+
+                try
+                {
+                    await this.zookeeper.createAsync(
+                        $"{this.stoppedPath}/{clientId}",
+                        System.Text.Encoding.UTF8.GetBytes("0"),
+                        ZooDefs.Ids.OPEN_ACL_UNSAFE,
+                        CreateMode.EPHEMERAL);
+
+                    succeeded = true;
+                }
+                catch (KeeperException.NodeExistsException)
+                {
+                    succeeded = true;
+                }
+                catch (KeeperException.NoNodeException e)
+                {
+                    throw new ZkInvalidOperationException($"Could not {actionToPerform} as the stopped znode does not exist.", e);
+                }
+                catch (KeeperException.ConnectionLossException)
+                {
+                    // do nothing, the next iteration will try again
+                }
+                catch (KeeperException.SessionExpiredException e)
+                {
+                    throw new ZkSessionExpiredException($"Could not {actionToPerform} as the session has expired: ", e);
+                }
+                catch (Exception e)
+                {
+                    throw new ZkInvalidOperationException($"Could not {actionToPerform} due to an unexpected error", e);
+                }
+            }
+        }
+        
+        public async Task SetFollowerAsStarted(string clientId)
+        {
+            var actionToPerform = $"set follower {clientId} as started";
+            bool succeeded = false;
+            while (!succeeded)
+            {
+                await BlockUntilConnected(actionToPerform);
+
+                try
+                {
+                    await this.zookeeper.deleteAsync($"{this.stoppedPath}/{clientId}");
+                    succeeded = true;
+                }
+                catch (KeeperException.NoNodeException)
+                {
+                    succeeded = true;
+                }
+                catch (KeeperException.ConnectionLossException)
+                {
+                    // do nothing, the next iteration will try again
+                }
+                catch (KeeperException.SessionExpiredException e)
+                {
+                    throw new ZkSessionExpiredException($"Could not {actionToPerform} as the session has expired: ", e);
+                }
+                catch (Exception e)
+                {
+                    throw new ZkInvalidOperationException($"Could not {actionToPerform} due to an unexpected error", e);
+                }
+            }
+        }
+
+        public async Task<ResourcesZnode> GetResourcesAsync(Watcher childWatcher, Watcher dataWatcher)
+        {
+            var actionToPerform = "get the list of resources";
+            while (true)
+            {
+                await BlockUntilConnected(actionToPerform);
+
+                try
+                {
+                    DataResult dataResult = null;
+                    if(dataWatcher != null)
+                        dataResult = await this.zookeeper.getDataAsync(this.resourcesPath, dataWatcher);
+                    else
+                        dataResult = await this.zookeeper.getDataAsync(this.resourcesPath);
+
+                    ChildrenResult childrenResult = null;
+                    if(childWatcher != null)
+                        childrenResult = await this.zookeeper.getChildrenAsync(this.resourcesPath, childWatcher);
+                    else
+                        childrenResult = await this.zookeeper.getChildrenAsync(this.resourcesPath);
+                    
+                    var resourcesZnodeData = JsonConvert.DeserializeObject<ResourcesZnodeData>(
                         System.Text.Encoding.UTF8.GetString(dataResult.Data));
+
+                    if (resourcesZnodeData == null)
+                        resourcesZnodeData = new ResourcesZnodeData();
+
+                    return new ResourcesZnode()
+                    {
+                        ResourceAssignments = resourcesZnodeData,
+                        Resources = childrenResult.Children,
+                        Version = dataResult.Stat.getVersion()
+                    };
+                }
+                catch (KeeperException.NoNodeException e)
+                {
+                    throw new ZkInvalidOperationException(
+                        $"Could not {actionToPerform} as the resources node does not exist.", e);
+                }
+                catch (KeeperException.ConnectionLossException)
+                {
+                    // do nothing, the next iteration will try again
+                }
+                catch (KeeperException.SessionExpiredException e)
+                {
+                    throw new ZkSessionExpiredException($"Could not {actionToPerform} as the session has expired: ", e);
+                }
+                catch (Exception e)
+                {
+                    throw new ZkInvalidOperationException($"Could not {actionToPerform} due to an unexpected error", e);
+                }
+            }
+        }
+        
+        public async Task<int> SetResourcesAsync(ResourcesZnode resourcesZnode)
+        {
+            var actionToPerform = "set resource assignments";
+            while (true)
+            {
+                await BlockUntilConnected(actionToPerform);
+
+                try
+                {
+                    var data = System.Text.Encoding.UTF8.GetBytes(
+                        JsonConvert.SerializeObject(resourcesZnode.ResourceAssignments));
+                    var stat = await zookeeper.setDataAsync(this.resourcesPath, data, resourcesZnode.Version);
+                    return stat.getVersion();
+                }
+                catch (KeeperException.BadVersionException e)
+                {
+                    throw new ZkStaleVersionException($"Could not {actionToPerform} due to a bad version number.", e);
+                }
+                catch (KeeperException.NoNodeException e)
+                {
+                    throw new ZkInvalidOperationException($"Could not {actionToPerform} as the node does not exist.", e);
+                }
+                catch (KeeperException.ConnectionLossException)
+                {
+                    // do nothing, the next iteration will try again
+                }
+                catch (KeeperException.SessionExpiredException e)
+                {
+                    throw new ZkSessionExpiredException($"Could not {actionToPerform} as the session has expired: ", e);
+                }
+                catch (Exception e)
+                {
+                    throw new ZkInvalidOperationException($"Could not {actionToPerform} due to an unexpected error", e);
+                }
+            }
+        }
+
+        public async Task RemoveResourceBarrierAsync(string resource)
+        {
+            var actionToPerform = $"remove resource barrier on {resource}";
+            bool succeeded = false;
+            while (!succeeded)
+            {
+                await BlockUntilConnected(actionToPerform);
+
+                try
+                {
+                    await this.zookeeper.deleteAsync($"{this.resourcesPath}/{resource}/barrier");
+                    succeeded = true;
+                }
+                catch (KeeperException.NoNodeException)
+                {
+                    succeeded = true;
+                }
+                catch (KeeperException.ConnectionLossException)
+                {
+                    // do nothing, the next iteration will try again
+                }
+                catch (KeeperException.SessionExpiredException e)
+                {
+                    throw new ZkSessionExpiredException($"Could not {actionToPerform} as the session has expired: ", e);
+                }
+                catch (Exception e)
+                {
+                    throw new ZkInvalidOperationException($"Could not {actionToPerform} due to an unexpected error", e);
+                }
+            }
+        }
+        
+        public async Task TryPutResourceBarrierAsync(string resource, CancellationToken waitToken, ILogger logger)
+        {
+            var sw = new Stopwatch();
+            sw.Start();
+            var actionToPerform = $"try put resource barrier on {resource}";
+            bool succeeded = false;
+            while (!succeeded)
+            {
+                await BlockUntilConnected(actionToPerform);
+
+                try
+                {
+                    await this.zookeeper.createAsync(
+                        $"{this.resourcesPath}/{resource}/barrier",
+                        System.Text.Encoding.UTF8.GetBytes(this.clientId),
+                        ZooDefs.Ids.OPEN_ACL_UNSAFE,
+                        CreateMode.EPHEMERAL);
+                    succeeded = true;
+                }
+                catch (KeeperException.NodeExistsException)
+                {
+                    var (exists, owner) = await GetResourceBarrierOwnerAsync(resource);
+                    if (exists && owner.Equals(this.clientId))
+                    {
+                        succeeded = true;
+                    }
+                    else
+                    {
+                        logger.Info(this.clientId, $"Waiting for {owner} to release its barrier on {resource}");
+                        // wait for two seconds, will retry in next iteration
+                        for (int i = 0; i < 20; i++)
+                        {
+                            await WaitFor(TimeSpan.FromMilliseconds(100));
+                            if (waitToken.IsCancellationRequested)
+                                throw new ZkOperationCancelledException(
+                                    $"Could not {actionToPerform} as the operation was cancelled.");
+                        }
+                    }
+                }
+                catch (KeeperException.NoNodeException e)
+                {
+                    throw new ZkInvalidOperationException($"Could not {actionToPerform} as the resource node does not exist.", e);
+                }
+                catch (KeeperException.ConnectionLossException)
+                {
+                    // do nothing, the next iteration will try again
+                }
+                catch (KeeperException.SessionExpiredException e)
+                {
+                    throw new ZkSessionExpiredException($"Could not {actionToPerform} as the session has expired: ", e);
+                }
+                catch (Exception e)
+                {
+                    throw new ZkInvalidOperationException($"Could not {actionToPerform} due to an unexpected error", e);
+                }
+            }
+        }
+
+        private async Task<(bool, string)> GetResourceBarrierOwnerAsync(string resource)
+        {
+            var actionToPerform = "get resource barrier owner";
+            while (true)
+            {
+                await BlockUntilConnected(actionToPerform);
+
+                try
+                {
+                    var dataResult = await zookeeper.getDataAsync($"{this.resourcesPath}/{resource}/barrier");
+                    return (true, System.Text.Encoding.UTF8.GetString(dataResult.Data));
+                }
+                catch (KeeperException.NoNodeException)
+                {
+                    return (false, string.Empty);
+                }
+                catch (KeeperException.ConnectionLossException)
+                {
+                    // do nothing, the next iteration will try again
+                }
+                catch (KeeperException.SessionExpiredException e)
+                {
+                    throw new ZkSessionExpiredException($"Could not {actionToPerform} as the session has expired: ", e);
+                }
+                catch (Exception e)
+                {
+                    throw new ZkInvalidOperationException($"Could not {actionToPerform} due to an unexpected error", e);
+                }
+            }
+        }
+        
+        public async Task<List<string>> GetStoppedAsync()
+        {
+            var actionToPerform = "get the list of stopped clients";
+            while (true)
+            {
+                await BlockUntilConnected(actionToPerform);
+
+                try
+                {
+                    var childrenResult = await this.zookeeper.getChildrenAsync(this.stoppedPath);
+                    return childrenResult.Children;
+                }
+                catch (KeeperException.NoNodeException e)
+                {
+                    throw new ZkInvalidOperationException(
+                        $"Could not {actionToPerform} as the stopped node does not exist.", e);
+                }
+                catch (KeeperException.ConnectionLossException)
+                {
+                    // do nothing, the next iteration will try again
+                }
+                catch (KeeperException.SessionExpiredException e)
+                {
+                    throw new ZkSessionExpiredException($"Could not {actionToPerform} as the session has expired: ", e);
+                }
+                catch (Exception e)
+                {
+                    throw new ZkInvalidOperationException($"Could not {actionToPerform} due to an unexpected error", e);
+                }
+            }
+        }
+
+        public async Task<int> WatchEpochAsync(Watcher watcher)
+        {
+            var actionToPerform = "set a watch on epoch";
+            while (true)
+            {
+                await BlockUntilConnected(actionToPerform);
+
+                try
+                {
+                    var stat = await zookeeper.existsAsync(this.epochPath, watcher);
+                    return stat.getVersion();
+                }
+                catch (KeeperException.NoNodeException e)
+                {
+                    throw new ZkInvalidOperationException($"Could not {actionToPerform} as the epoch node does not exist.", e);
+                }
+                catch (KeeperException.ConnectionLossException)
+                {
+                    // do nothing, the next iteration will try again
+                }
+                catch (KeeperException.SessionExpiredException e)
+                {
+                    throw new ZkSessionExpiredException($"Could not {actionToPerform} as the session has expired: ", e);
+                }
+                catch (Exception e)
+                {
+                    throw new ZkInvalidOperationException($"Could not {actionToPerform} due to an unexpected error", e);
+                }
+            }
+        }
+        
+        public async Task<StatusZnode> WatchStatusAsync(Watcher watcher)
+        {
+            var actionToPerform = "set a watch on status";
+            while (true)
+            {
+                await BlockUntilConnected(actionToPerform);
+
+                try
+                {
+                    var dataResult = await zookeeper.getDataAsync(this.statusPath, watcher);
+                    return new StatusZnode()
+                    {
+                        RebalancingStatus = (RebalancingStatus) BitConverter.ToInt32(dataResult.Data, 0),
+                        Version = dataResult.Stat.getVersion()
+                    };
+                }
+                catch (KeeperException.NoNodeException e)
+                {
+                    throw new ZkInvalidOperationException($"Could not {actionToPerform} as the status node does not exist.", e);
+                }
+                catch (KeeperException.ConnectionLossException)
+                {
+                    // do nothing, the next iteration will try again
+                }
+                catch (KeeperException.SessionExpiredException e)
+                {
+                    throw new ZkSessionExpiredException($"Could not {actionToPerform} as the session has expired: ", e);
+                }
+                catch (Exception e)
+                {
+                    throw new ZkInvalidOperationException($"Could not {actionToPerform} due to an unexpected error", e);
+                }
+            }
+        }
+        
+        public async Task WatchResourcesChildrenAsync(Watcher watcher)
+        {
+            var actionToPerform = "set a watch on resource children";
+            bool succeeded = false;
+            while (!succeeded)
+            {
+                await BlockUntilConnected(actionToPerform);
+
+                try
+                {
+                    await this.zookeeper.getChildrenAsync(this.resourcesPath, watcher);
+                    succeeded = true;
+                }
+                catch (KeeperException.NoNodeException e)
+                {
+                    throw new ZkInvalidOperationException($"Could not {actionToPerform} as the resources node does not exist.", e);
+                }
+                catch (KeeperException.ConnectionLossException)
+                {
+                    // do nothing, the next iteration will try again
+                }
+                catch (KeeperException.SessionExpiredException e)
+                {
+                    throw new ZkSessionExpiredException($"Could not {actionToPerform} as the session has expired: ", e);
+                }
+                catch (Exception e)
+                {
+                    throw new ZkInvalidOperationException($"Could not {actionToPerform} due to an unexpected error", e);
+                }
+            }
+        }
+
+        public async Task<int> WatchResourcesDataAsync(Watcher watcher)
+        {
+            var actionToPerform = "set a watch on resource data";
+            while (true)
+            {
+                await BlockUntilConnected(actionToPerform);
+
+                try
+                {
+                    var data = await this.zookeeper.getDataAsync(this.resourcesPath, watcher);
+                    return data.Stat.getVersion();
+                }
+                catch (KeeperException.NoNodeException e)
+                {
+                    throw new ZkInvalidOperationException(
+                        $"Could not {actionToPerform} as the resources node does not exist.", e);
+                }
+                catch (KeeperException.ConnectionLossException)
+                {
+                    // do nothing, the next iteration will try again
+                }
+                catch (KeeperException.SessionExpiredException e)
+                {
+                    throw new ZkSessionExpiredException($"Could not {actionToPerform} as the session has expired: ", e);
+                }
+                catch (Exception e)
+                {
+                    throw new ZkInvalidOperationException($"Could not {actionToPerform} due to an unexpected error", e);
+                }
+            }
+        }
+        
+        public async Task WatchNodesAsync(Watcher watcher)
+        {
+            var actionToPerform = "set a watch on clients children";
+            bool succeeded = false;
+            while (!succeeded)
+            {
+                await BlockUntilConnected(actionToPerform);
+
+                try
+                {
+                    await this.zookeeper.getChildrenAsync(this.clientsPath, watcher);
+                    succeeded = true;
+                }
+                catch (KeeperException.NoNodeException e)
+                {
+                    throw new ZkInvalidOperationException($"Could not {actionToPerform} as the clients node does not exist.", e);
+                }
+                catch (KeeperException.ConnectionLossException)
+                {
+                    // do nothing, the next iteration will try again
+                }
+                catch (KeeperException.SessionExpiredException e)
+                {
+                    throw new ZkSessionExpiredException($"Could not {actionToPerform} as the session has expired: ", e);
+                }
+                catch (Exception e)
+                {
+                    throw new ZkInvalidOperationException($"Could not {actionToPerform} due to an unexpected error", e);
+                }
+            }
+        }
+        
+        public async Task WatchSiblingNodeAsync(string siblingPath, Watcher watcher)
+        {
+            var actionToPerform = "set a watch on sibling client";
+            bool succeeded = false;
+            while (!succeeded)
+            {
+                await BlockUntilConnected(actionToPerform);
+
+                try
+                {
+                    await this.zookeeper.getDataAsync(siblingPath, watcher);
+                    succeeded = true;
+                }
+                catch (KeeperException.NoNodeException e)
+                {
+                    throw new ZkNoEphemeralNodeWatchException($"Could not {actionToPerform} as the client node does not exist.", e);
+                }
+                catch (KeeperException.ConnectionLossException)
+                {
+                    // do nothing, the next iteration will try again
+                }
+                catch (KeeperException.SessionExpiredException e)
+                {
+                    throw new ZkSessionExpiredException($"Could not {actionToPerform} as the session has expired: ", e);
+                }
+                catch (Exception e)
+                {
+                    throw new ZkInvalidOperationException($"Could not {actionToPerform} due to an unexpected error", e);
+                }
+            }
+        }
+
+        private async Task BlockUntilConnected(string logAction)
+        {
+            while (!this.token.IsCancellationRequested && this.keeperState != Event.KeeperState.SyncConnected)
+            {
+                if(this.keeperState == Event.KeeperState.Expired)
+                    throw new ZkSessionExpiredException($"Could not {logAction} because the session has expired");
                 
-                if(resourcesZnodeData == null)
-                    resourcesZnodeData = new ResourcesZnodeData();
+                await WaitFor(TimeSpan.FromMilliseconds(100));
+            }
 
-                return new ZkResponse<ResourcesZnode>(ZkResult.Ok, new ResourcesZnode()
-                {
-                    ResourceAssignments = resourcesZnodeData,
-                    Resources = childrenResult.Children,
-                    Version = dataResult.Stat.getVersion()
-                });
-            }
-            catch (KeeperException.NoNodeException e)
-            {
-                this.logger.Error(this.clientId, "Could not get resources as the resources node does not exist: " + e);
-                return new ZkResponse<ResourcesZnode>(ZkResult.NoZnode);
-            }
-            catch (KeeperException.ConnectionLossException e)
-            {
-                this.logger.Error(this.clientId, "Could not get resources as the connection has been lost: " + e);
-                return new ZkResponse<ResourcesZnode>(ZkResult.ConnectionLost);
-            }
-            catch (KeeperException.SessionExpiredException e)
-            {
-                this.logger.Error(this.clientId, "Could not get resources as the session has expired: " + e);
-                return new ZkResponse<ResourcesZnode>(ZkResult.SessionExpired);
-            }
-            catch (Exception e)
-            {
-                this.logger.Error(this.clientId, "Could not get resources: " + e);
-                return new ZkResponse<ResourcesZnode>(ZkResult.UnexpectedError);
-            }
+            if (this.token.IsCancellationRequested)
+                throw new ZkOperationCancelledException($"Could not {logAction} because the operation was cancelled");
         }
         
-        public async Task<ZkResponse<int>> SetResourcesAsync(ResourcesZnode resourcesZnode)
+        private async Task BlockUntilConnected(string logAction, CancellationToken waitingToken)
         {
-            try
+            while (!this.token.IsCancellationRequested
+                   && !waitingToken.IsCancellationRequested
+                   && this.keeperState != Event.KeeperState.SyncConnected)
             {
-                var data = System.Text.Encoding.UTF8.GetBytes(
-                    JsonConvert.SerializeObject(resourcesZnode.ResourceAssignments));
-                var stat = await zookeeper.setDataAsync(this.resourcesPath, data, resourcesZnode.Version);
-                return new ZkResponse<int>(ZkResult.Ok, stat.getVersion());
+                if(this.keeperState == Event.KeeperState.Expired)
+                    throw new ZkSessionExpiredException($"Could not {logAction} because the session has expired");
+                
+                await WaitFor(TimeSpan.FromMilliseconds(100));
             }
-            catch (KeeperException.BadVersionException e)
-            {
-                this.logger.Error(this.clientId, "Could not set resource assignments due to a bad version number. " + e);
-                return new ZkResponse<int>(ZkResult.BadVersion);
-            }
-            catch (KeeperException.NoNodeException e)
-            {
-                this.logger.Error(this.clientId, "Could not set resource assignments as the node does not exist: " + e);
-                return new ZkResponse<int>(ZkResult.NoZnode);
-            }
-            catch (KeeperException.ConnectionLossException e)
-            {
-                this.logger.Error(this.clientId, "Could not set resource assignments as the connection has been lost: " + e);
-                return new ZkResponse<int>(ZkResult.ConnectionLost);
-            }
-            catch (KeeperException.SessionExpiredException e)
-            {
-                this.logger.Error(this.clientId, "Could not set resource assignments as the session has expired: " + e);
-                return new ZkResponse<int>(ZkResult.SessionExpired);
-            }
-            catch (Exception e)
-            {
-                this.logger.Error(this.clientId, "Could not set resource assignments: " + e);
-                return new ZkResponse<int>(ZkResult.UnexpectedError);
-            }
+
+            if (this.token.IsCancellationRequested || waitingToken.IsCancellationRequested)
+                throw new ZkOperationCancelledException($"Could not {logAction} because the operation was cancelled");
         }
 
-        public async Task<ZkResult> RemoveResourceBarrierAsync(string resource)
+        private async Task WaitFor(TimeSpan waitPeriod)
         {
             try
             {
-                await this.zookeeper.deleteAsync($"{this.resourcesPath}/{resource}/barrier");
-                return ZkResult.Ok;
+                await Task.Delay(waitPeriod, this.token);
             }
-            catch (KeeperException.NoNodeException)
-            {
-                return ZkResult.Ok;
-            }
-            catch (KeeperException.ConnectionLossException e)
-            {
-                this.logger.Error(this.clientId, "Could not remove barrier from the resource as the connection has been lost: " + e);
-                return ZkResult.ConnectionLost;
-            }
-            catch (KeeperException.SessionExpiredException e)
-            {
-                this.logger.Error(this.clientId, "Could not remove barrier from the resource as the session has expired: " + e);
-                return ZkResult.SessionExpired;
-            }
-            catch (Exception e)
-            {
-                this.logger.Error(this.clientId, "Could not remove barrier from the resource: " + e);
-                return ZkResult.UnexpectedError;
-            }
+            catch (TaskCanceledException)
+            {}
         }
         
-        public async Task<ZkResult> TryPutResourceBarrierAsync(string resource)
+        private async Task WaitFor(TimeSpan waitPeriod, CancellationToken waitToken)
         {
             try
             {
-                await this.zookeeper.createAsync(
-                    $"{this.resourcesPath}/{resource}/barrier",
-                    System.Text.Encoding.UTF8.GetBytes("0"),
-                    ZooDefs.Ids.OPEN_ACL_UNSAFE,
-                    CreateMode.EPHEMERAL);
-                return ZkResult.Ok;
+                await Task.Delay(waitPeriod, waitToken);
             }
-            catch (KeeperException.NodeExistsException)
-            {
-                return ZkResult.NodeAlreadyExists;
-            }
-            catch (KeeperException.NoNodeException e)
-            {
-                this.logger.Error(this.clientId, "Could not add a barrier to the resource as the resources node does not exist: " +
-                                  e);
-                return ZkResult.NoZnode;
-            }
-            catch (KeeperException.ConnectionLossException e)
-            {
-                this.logger.Error(this.clientId, "Could not add a barrier to the resource as the connection has been lost: " + e);
-                return ZkResult.ConnectionLost;
-            }
-            catch (KeeperException.SessionExpiredException e)
-            {
-                this.logger.Error(this.clientId, "Could not add a barrier to the resource as the session has expired: " + e);
-                return ZkResult.SessionExpired;
-            }
-            catch (Exception e)
-            {
-                this.logger.Error(this.clientId, "Could not add a barrier to the resource: " + e);
-                return ZkResult.UnexpectedError;
-            }
-        }
-        
-        public async Task<ZkResponse<List<string>>> GetStoppedAsync()
-        {
-            try
-            {
-                var childrenResult = await this.zookeeper.getChildrenAsync(this.stoppedPath);
-                return new ZkResponse<List<string>>(ZkResult.Ok, childrenResult.Children);
-            }
-            catch (KeeperException.NoNodeException e)
-            {
-                this.logger.Error(this.clientId, "Could not get stopped clients as the stopped node does not exist: " + e);
-                return new ZkResponse<List<string>>(ZkResult.NoZnode);
-            }
-            catch (KeeperException.ConnectionLossException e)
-            {
-                this.logger.Error(this.clientId, "Could not get stopped clients as the connection has been lost: " + e);
-                return new ZkResponse<List<string>>(ZkResult.ConnectionLost);
-            }
-            catch (KeeperException.SessionExpiredException e)
-            {
-                this.logger.Error(this.clientId, "Could not get stopped clients as the session has expired: " + e);
-                return new ZkResponse<List<string>>(ZkResult.SessionExpired);
-            }
-            catch (Exception e)
-            {
-                this.logger.Error(this.clientId, "Could not get stopped clients: " + e);
-                return new ZkResponse<List<string>>(ZkResult.UnexpectedError);
-            }
-        }
-
-        public async Task<ZkResponse<int>> WatchEpochAsync(Watcher watcher)
-        {
-            try
-            {
-                var stat = await zookeeper.existsAsync(this.epochPath, watcher);
-                return new ZkResponse<int>(ZkResult.Ok, stat.getVersion());
-            }
-            catch (KeeperException.NoNodeException e)
-            {
-                this.logger.Error(this.clientId, "Could not set a watch on epoch as the epoch znode does not exist: " + e);
-                return new ZkResponse<int>(ZkResult.NoZnode);
-            }
-            catch (KeeperException.ConnectionLossException e)
-            {
-                this.logger.Error(this.clientId, "Could not set a watch on epoch as the connection has been lost: " + e);
-                return new ZkResponse<int>(ZkResult.ConnectionLost);
-            }
-            catch (KeeperException.SessionExpiredException e)
-            {
-                this.logger.Error(this.clientId, "Could not set a watch on epoch as the session has expired: " + e);
-                return new ZkResponse<int>(ZkResult.SessionExpired);
-            }
-            catch (Exception e)
-            {
-                this.logger.Error(this.clientId, "Could not set a watch on epoch: " + e);
-                return new ZkResponse<int>(ZkResult.UnexpectedError);
-            }
-        }
-        
-        public async Task<ZkResponse<StatusZnode>> WatchStatusAsync(Watcher watcher)
-        {
-            try
-            {
-                var dataResult = await zookeeper.getDataAsync(this.statusPath, watcher);
-                return new ZkResponse<StatusZnode>(ZkResult.Ok, new StatusZnode()
-                {
-                    RebalancingStatus = (RebalancingStatus) BitConverter.ToInt32(dataResult.Data, 0),
-                    Version = dataResult.Stat.getVersion()
-                });
-            }
-            catch (KeeperException.NoNodeException e)
-            {
-                this.logger.Error(this.clientId, "Could not set a watch on status as the status znode does not exist: " + e);
-                return new ZkResponse<StatusZnode>(ZkResult.NoZnode);
-            }
-            catch (KeeperException.ConnectionLossException e)
-            {
-                this.logger.Error(this.clientId, "Could not set a watch on status as the connection has been lost: " + e);
-                return new ZkResponse<StatusZnode>(ZkResult.ConnectionLost);
-            }
-            catch (KeeperException.SessionExpiredException e)
-            {
-                this.logger.Error(this.clientId, "Could not set a watch on status as the session has expired: " + e);
-                return new ZkResponse<StatusZnode>(ZkResult.SessionExpired);
-            }
-            catch (Exception e)
-            {
-                this.logger.Error(this.clientId, "Could not set a watch on status: " + e);
-                return new ZkResponse<StatusZnode>(ZkResult.UnexpectedError);
-            }
-        }
-        
-        public async Task<ZkResult> WatchResourcesChildrenAsync(Watcher watcher)
-        {
-            try
-            {
-                await this.zookeeper.getChildrenAsync(this.resourcesPath, watcher);
-                return ZkResult.Ok;
-            }
-            catch (KeeperException.NoNodeException e)
-            {
-                this.logger.Error(this.clientId, "Could not set a watch on resources children as the resources znode does not exist: " + e);
-                return ZkResult.NoZnode;
-            }
-            catch (KeeperException.ConnectionLossException e)
-            {
-                this.logger.Error(this.clientId, "Could not set a watch on resources as the connection has been lost: " + e);
-                return ZkResult.ConnectionLost;
-            }
-            catch (KeeperException.SessionExpiredException e)
-            {
-                this.logger.Error(this.clientId, "Could not set a watch on resources as the session has expired: " + e);
-                return ZkResult.SessionExpired;
-            }
-            catch (Exception e)
-            {
-                this.logger.Error(this.clientId, "Could not set a watch on resources: " + e);
-                return ZkResult.UnexpectedError;
-            }
-        }
-
-        public async Task<ZkResponse<int>> WatchResourcesDataAsync(Watcher watcher)
-        {
-            try
-            {
-                var data = await this.zookeeper.getDataAsync(this.resourcesPath, watcher);
-                return new ZkResponse<int>(ZkResult.Ok, data.Stat.getVersion());
-            }
-            catch (KeeperException.NoNodeException e)
-            {
-                this.logger.Error(this.clientId, "Could not set a data watch on resource znode as the resources znode does not exist: " + e);
-                return new ZkResponse<int>(ZkResult.NoZnode);
-            }
-            catch (KeeperException.ConnectionLossException e)
-            {
-                this.logger.Error(this.clientId, "Could not set a data watch on resource znode as the connection has been lost: " + e);
-                return new ZkResponse<int>(ZkResult.ConnectionLost);
-            }
-            catch (KeeperException.SessionExpiredException e)
-            {
-                this.logger.Error(this.clientId, "Could not set a data watch on resource znode as the session has expired: " + e);
-                return new ZkResponse<int>(ZkResult.SessionExpired);
-            }
-            catch (Exception e)
-            {
-                this.logger.Error(this.clientId, "Could not set a data watch on resource znode: " + e);
-                return new ZkResponse<int>(ZkResult.UnexpectedError);
-            }
-        }
-        
-        public async Task<ZkResult> WatchNodesAsync(Watcher watcher)
-        {
-            try
-            {
-                await this.zookeeper.getChildrenAsync(this.clientsPath, watcher);
-                return ZkResult.Ok;
-            }
-            catch (KeeperException.NoNodeException e)
-            {
-                this.logger.Error(this.clientId, "Could not set a watch on clients as the clients znode does not exist: " + e);
-                return ZkResult.NoZnode;
-            }
-            catch (KeeperException.ConnectionLossException e)
-            {
-                this.logger.Error(this.clientId, "Could not set a watch on clients as the connection has been lost: " + e);
-                return ZkResult.ConnectionLost;
-            }
-            catch (KeeperException.SessionExpiredException e)
-            {
-                this.logger.Error(this.clientId, "Could not set a watch on clients as the session has expired: " + e);
-                return ZkResult.SessionExpired;
-            }
-            catch (Exception e)
-            {
-                this.logger.Error(this.clientId, "Could not set a watch on clients: " + e);
-                return ZkResult.UnexpectedError;
-            }
-        }
-        
-        public async Task<ZkResult> WatchSiblingNodeAsync(string siblingPath, Watcher watcher)
-        {
-            try
-            {
-                await this.zookeeper.getDataAsync(siblingPath, watcher);
-                return ZkResult.Ok;
-            }
-            catch (KeeperException.NoNodeException e)
-            {
-                this.logger.Error(this.clientId, "Could not set a watch on a sibling client as the node does not exist: " + e);
-                return ZkResult.NoZnode;
-            }
-            catch (KeeperException.ConnectionLossException e)
-            {
-                this.logger.Error(this.clientId, "Could not set a watch on a sibling client as the connection has been lost: " + e);
-                return ZkResult.ConnectionLost;
-            }
-            catch (KeeperException.SessionExpiredException e)
-            {
-                this.logger.Error(this.clientId, "Could not set a watch on a sibling client as the session has expired: " + e);
-                return ZkResult.SessionExpired;
-            }
-            catch (Exception e)
-            {
-                this.logger.Error(this.clientId, "Could not set a watch on a sibling client: " + e);
-                return ZkResult.UnexpectedError;
-            }
+            catch (TaskCanceledException)
+            {}
         }
     }
 }

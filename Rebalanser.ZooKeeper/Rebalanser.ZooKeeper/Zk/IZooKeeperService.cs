@@ -1,43 +1,45 @@
 using System;
 using System.Collections.Generic;
+using System.Threading;
 using System.Threading.Tasks;
 using org.apache.zookeeper;
+using Rebalanser.Core.Logging;
 
 namespace Rebalanser.ZooKeeper.Zk
 {
     public interface IZooKeeperService
     {
         Watcher.Event.KeeperState GetKeeperState();
-        Task<bool> StartSessionAsync(TimeSpan sessionTimeout, TimeSpan connectTimeout);
+        Task<bool> StartSessionAsync(TimeSpan sessionTimeout, TimeSpan connectTimeout, CancellationToken token);
         Task CloseSessionAsync();
-        Task<bool> InitializeGlobalBarrierAsync(string clientsPath,
+        Task InitializeGlobalBarrierAsync(string clientsPath,
             string statusPath,
             string stoppedPath,
             string resourcesPath,
             string epochPath);
-        Task<bool> InitializeResourceBarrierAsync(string clientsPath,
+        Task InitializeResourceBarrierAsync(string clientsPath,
             string resourcesPath,
             string epochPath);
-        Task<ZkResult> DeleteClientAsync(string clientPath);
-        Task<ZkResponse<string>> CreateClientAsync();
-        Task<ZkResult> EnsurePathAsync(string znodePath);
-        Task<ZkResponse<int>> IncrementEpochAsync(int currentEpoch);
-        Task<ZkResponse<int>> GetEpochAsync();
-        Task<ZkResponse<ClientsZnode>> GetActiveClientsAsync();
-        Task<ZkResponse<StatusZnode>> GetStatusAsync();
-        Task<ZkResponse<int>> SetStatus(StatusZnode statusZnode);
-        Task<ZkResult> SetFollowerAsStopped(string clientId);
-        Task<ZkResult> SetFollowerAsStarted(string clientId);
-        Task<ZkResponse<ResourcesZnode>> GetResourcesAsync();
-        Task<ZkResponse<int>> SetResourcesAsync(ResourcesZnode resourcesZnode);
-        Task<ZkResponse<List<string>>> GetStoppedAsync();
-        Task<ZkResult> RemoveResourceBarrierAsync(string resourcePath);
-        Task<ZkResult> TryPutResourceBarrierAsync(string resourcePath);
-        Task<ZkResponse<int>> WatchEpochAsync(Watcher watcher);
-        Task<ZkResponse<StatusZnode>> WatchStatusAsync(Watcher watcher);
-        Task<ZkResult> WatchResourcesChildrenAsync(Watcher watcher);
-        Task<ZkResponse<int>> WatchResourcesDataAsync(Watcher watcher);
-        Task<ZkResult> WatchNodesAsync(Watcher watcher);
-        Task<ZkResult> WatchSiblingNodeAsync(string siblingPath, Watcher watcher);
+        Task DeleteClientAsync(string clientPath);
+        Task<string> CreateClientAsync();
+        Task EnsurePathAsync(string znodePath);
+        Task<int> IncrementAndWatchEpochAsync(int currentEpoch, Watcher watcher);
+        Task<int> GetEpochAsync();
+        Task<ClientsZnode> GetActiveClientsAsync();
+        Task<StatusZnode> GetStatusAsync();
+        Task<int> SetStatus(StatusZnode statusZnode);
+        Task SetFollowerAsStopped(string clientId);
+        Task SetFollowerAsStarted(string clientId);
+        Task<ResourcesZnode> GetResourcesAsync(Watcher childWatcher, Watcher dataWatcher);
+        Task<int> SetResourcesAsync(ResourcesZnode resourcesZnode);
+        Task RemoveResourceBarrierAsync(string resourcePath);
+        Task TryPutResourceBarrierAsync(string resourcePath, CancellationToken waitToken, ILogger logger);
+        Task<List<string>> GetStoppedAsync();
+        Task<int> WatchEpochAsync(Watcher watcher);
+        Task<StatusZnode> WatchStatusAsync(Watcher watcher);
+        Task WatchResourcesChildrenAsync(Watcher watcher);
+        Task<int> WatchResourcesDataAsync(Watcher watcher);
+        Task WatchNodesAsync(Watcher watcher);
+        Task WatchSiblingNodeAsync(string siblingPath, Watcher watcher);
     }
 }

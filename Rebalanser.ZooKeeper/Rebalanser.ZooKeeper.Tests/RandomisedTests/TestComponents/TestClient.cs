@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Threading.Tasks;
 using Rebalanser.Core;
+using Rebalanser.Core.Logging;
 
 namespace Rebalanser.ZooKeeper.Tests.RandomisedTests.TestComponents
 {
@@ -39,16 +40,20 @@ namespace Rebalanser.ZooKeeper.Tests.RandomisedTests.TestComponents
             Started = false;
         }
 
-        public async Task PerformActionAsync()
+        public async Task PerformActionAsync(ILogger logger)
         {
             if (Started)
             {
+                logger.Info("TEST RUNNER", "Stopping client");
                 Monitor.RegisterRemoveClient(this.Id);
                 await StopAsync();
+                logger.Info("TEST RUNNER", "Stopped client");
             }
             else
             {
+                logger.Info("TEST RUNNER", "Starting client");
                 await StartAsync();
+                logger.Info("TEST RUNNER", "Started client");
             }
         }
 

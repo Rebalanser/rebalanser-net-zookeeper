@@ -25,7 +25,7 @@ namespace Rebalanser.ZooKeeper.Tests
         {
             // ARRANGE
             var groupName = Guid.NewGuid().ToString();
-            await this.zkHelper.InitializeAsync("localhost:2181", "/rebalanser", TimeSpan.FromSeconds(100));
+            await this.zkHelper.InitializeAsync("/rebalanser", TimeSpan.FromSeconds(20), TimeSpan.FromSeconds(30));
             await this.zkHelper.PrepareResourceGroupAsync(groupName, "res", 5);
 
             Providers.Register(GetProvider);
@@ -35,13 +35,12 @@ namespace Rebalanser.ZooKeeper.Tests
             var (client, testEvents) = CreateClient();
             await client.StartAsync(groupName, new ClientOptions() {AutoRecoveryOnError = false});
 
-            await Task.Delay(TimeSpan.FromSeconds(150));
+            await Task.Delay(TimeSpan.FromSeconds(15));
             
             // ASSERT
-            Assert.Equal(2, testEvents.Count);
-            Assert.Equal(EventType.Unassignment, testEvents[0].EventType);
-            Assert.Equal(EventType.Assignment, testEvents[1].EventType);
-            Assert.True(ResourcesMatch(expectedAssignedResources, testEvents[1].Resources.ToList()));
+            Assert.Equal(1, testEvents.Count);
+            Assert.Equal(EventType.Assignment, testEvents[0].EventType);
+            Assert.True(ResourcesMatch(expectedAssignedResources, testEvents[0].Resources.ToList()));
             
             await client.StopAsync(TimeSpan.FromSeconds(30));
         }
@@ -86,12 +85,13 @@ namespace Rebalanser.ZooKeeper.Tests
 
         private IRebalanserProvider GetProvider()
         {
-            return new ZooKeeperProvider("localhost:2181", 
+            return new ZooKeeperProvider(ZkHelper.ZooKeeperHosts, 
                 "/rebalanser", 
                 TimeSpan.FromSeconds(20),
                 TimeSpan.FromSeconds(20),
+                TimeSpan.FromSeconds(5), 
                 RebalancingMode.ResourceBarrier,
-                new ConsoleLogger());
+                new TestOutputLogger());
         }
 
         public void Dispose()
