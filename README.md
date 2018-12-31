@@ -1,5 +1,5 @@
 # rebalanser-net-zookeeper
-ZooKeeper backend for .NET Rebalanser.
+ZooKeeper backend for .NET Rebalanser (in development). Protocol and implementation still under development.
 
 ## Distributed Consensus of Resource Consumption Design
 Rebalanser.ZooKeeper is responsible for detecting changes to live clients and available resources and ensuring that all participating clients share the available resources equally.
