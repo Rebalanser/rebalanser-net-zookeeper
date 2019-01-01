@@ -22,7 +22,7 @@ namespace Rebalanser.ZooKeeper.Zk
             string epochPath);
         Task DeleteClientAsync(string clientPath);
         Task<string> CreateClientAsync();
-        Task EnsurePathAsync(string znodePath);
+        Task EnsurePathAsync(string znodePath, byte[] bytesToSet = null);
         Task<int> IncrementAndWatchEpochAsync(int currentEpoch, Watcher watcher);
         Task<int> GetEpochAsync();
         Task<ClientsZnode> GetActiveClientsAsync();

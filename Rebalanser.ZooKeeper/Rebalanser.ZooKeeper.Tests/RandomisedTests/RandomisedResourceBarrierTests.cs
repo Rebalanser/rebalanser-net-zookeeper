@@ -23,7 +23,7 @@ namespace Rebalanser.ZooKeeper.Tests.RandomisedTests
         }
 
         [Fact]
-        public async Task RandomisedReleaseBarrierTest_LongInterval_LowClient_LowResource_FullCheck()
+        public async Task ResourceBarrier_RandomisedReleaseBarrierTest_LongInterval_LowClient_LowResource_FullCheck()
         {
             var config = new RandomConfig()
             {
@@ -35,11 +35,71 @@ namespace Rebalanser.ZooKeeper.Tests.RandomisedTests
                 CheckType = CheckType.FullCheck
             };
             
+            this.currentConfig = config;
+            Providers.Register(GetResourceBarrierProvider);
+            
+            await RandomisedReleaseBarrierTest(config);
+        }
+        
+        [Fact]
+        public async Task GlobalBarrier_RandomisedReleaseBarrierTest_LongInterval_LowClient_LowResource_FullCheck()
+        {
+            var config = new RandomConfig()
+            {
+                ClientCount = 3,
+                ResourceCount = 6,
+                TestDuration = TimeSpan.FromMinutes(120),
+                MaxInterval = TimeSpan.FromSeconds(60),
+                RandomiseInterval = false,
+                CheckType = CheckType.FullCheck
+            };
+            
+            this.currentConfig = config;
+            Providers.Register(GetGlobalBarrierProvider);
+            
+            await RandomisedReleaseBarrierTest(config);
+        }
+        
+        [Fact]
+        public async Task ResourceBarrier_RandomisedReleaseBarrierTest_LongInterval_MediumClient_LowResource_FullCheck()
+        {
+            var config = new RandomConfig()
+            {
+                ClientCount = 10,
+                ResourceCount = 5,
+                TestDuration = TimeSpan.FromMinutes(120),
+                MaxInterval = TimeSpan.FromSeconds(60),
+                RandomiseInterval = false,
+                CheckType = CheckType.FullCheck
+            };
+            
+            this.currentConfig = config;
+            Providers.Register(GetResourceBarrierProvider);
+            
+            await RandomisedReleaseBarrierTest(config);
+        }
+        
+        [Fact]
+        public async Task GlobalBarrier_RandomisedReleaseBarrierTest_LongInterval_MediumClient_LowResource_FullCheck()
+        {
+            var config = new RandomConfig()
+            {
+                ClientCount = 10,
+                ResourceCount = 5,
+                TestDuration = TimeSpan.FromMinutes(120),
+                MaxInterval = TimeSpan.FromSeconds(60),
+                RandomiseInterval = false,
+                CheckType = CheckType.FullCheck
+            };
+            
+            this.currentConfig = config;
+            Providers.Register(GetGlobalBarrierProvider);
+            
             await RandomisedReleaseBarrierTest(config);
         }
 
         [Fact]
-        public async Task RandomisedReleaseBarrierTest_LongInterval_MediumClient_MediumResource_FullCheck()
+        public async Task ResourceBarrier_RandomisedReleaseBarrierTest_LongInterval_MediumClient_MediumResource_FullCheck()
         {
             var config = new RandomConfig()
             {
@@ -51,11 +111,33 @@ namespace Rebalanser.ZooKeeper.Tests.RandomisedTests
                 CheckType = CheckType.FullCheck
             };
             
+            this.currentConfig = config;
+            Providers.Register(GetResourceBarrierProvider);
+            
             await RandomisedReleaseBarrierTest(config);
         }
         
         [Fact]
-        public async Task RandomisedReleaseBarrierTest_LongInterval_LargeClient_LargeResource_FullCheck()
+        public async Task GlobalBarrier_RandomisedReleaseBarrierTest_LongInterval_MediumClient_MediumResource_FullCheck()
+        {
+            var config = new RandomConfig()
+            {
+                ClientCount = 10,
+                ResourceCount = 60,
+                TestDuration = TimeSpan.FromMinutes(120),
+                MaxInterval = TimeSpan.FromSeconds(60),
+                RandomiseInterval = false,
+                CheckType = CheckType.FullCheck
+            };
+            
+            this.currentConfig = config;
+            Providers.Register(GetGlobalBarrierProvider);
+            
+            await RandomisedReleaseBarrierTest(config);
+        }
+        
+        [Fact]
+        public async Task ResourceBarrier_RandomisedReleaseBarrierTest_LongInterval_LargeClient_LargeResource_FullCheck()
         {
             var config = new RandomConfig()
             {
@@ -71,15 +153,18 @@ namespace Rebalanser.ZooKeeper.Tests.RandomisedTests
                 SessionTimeout = TimeSpan.FromMinutes(1)
             };
             
+            this.currentConfig = config;
+            Providers.Register(GetResourceBarrierProvider);
+            
             await RandomisedReleaseBarrierTest(config);
         }
         
         [Fact]
-        public async Task RandomisedReleaseBarrierTest_LongInterval_SmallClient_LargeResource_FullCheck()
+        public async Task GlobalBarrier_RandomisedReleaseBarrierTest_LongInterval_LargeClient_LargeResource_FullCheck()
         {
             var config = new RandomConfig()
             {
-                ClientCount = 10,
+                ClientCount = 30,
                 ResourceCount = 200,
                 TestDuration = TimeSpan.FromMinutes(120),
                 MaxInterval = TimeSpan.FromMinutes(5),
@@ -91,11 +176,60 @@ namespace Rebalanser.ZooKeeper.Tests.RandomisedTests
                 SessionTimeout = TimeSpan.FromMinutes(1)
             };
             
+            this.currentConfig = config;
+            Providers.Register(GetGlobalBarrierProvider);
+            
             await RandomisedReleaseBarrierTest(config);
         }
         
         [Fact]
-        public async Task RandomisedReleaseBarrierTest_ShortRandomInterval_MediumClient_MediumResource_ConditionalCheck()
+        public async Task ResourceBarrier_RandomisedReleaseBarrierTest_LongInterval_SmallClient_LargeResource_FullCheck()
+        {
+            var config = new RandomConfig()
+            {
+                ClientCount = 10,
+                ResourceCount = 200,
+                TestDuration = TimeSpan.FromMinutes(480),
+                MaxInterval = TimeSpan.FromMinutes(5),
+                RandomiseInterval = false,
+                CheckType = CheckType.FullCheck,
+                StartUpClientInterval = TimeSpan.FromSeconds(2),
+                MinimumRebalancingInterval = TimeSpan.FromMinutes(2),
+                ConnectTimeout = TimeSpan.FromMinutes(1),
+                SessionTimeout = TimeSpan.FromMinutes(1)
+            };
+            
+            this.currentConfig = config;
+            Providers.Register(GetResourceBarrierProvider);
+            
+            await RandomisedReleaseBarrierTest(config);
+        }
+        
+        [Fact]
+        public async Task GlobalBarrier_RandomisedReleaseBarrierTest_LongInterval_SmallClient_LargeResource_FullCheck()
+        {
+            var config = new RandomConfig()
+            {
+                ClientCount = 10,
+                ResourceCount = 200,
+                TestDuration = TimeSpan.FromMinutes(480),
+                MaxInterval = TimeSpan.FromMinutes(5),
+                RandomiseInterval = false,
+                CheckType = CheckType.FullCheck,
+                StartUpClientInterval = TimeSpan.FromSeconds(2),
+                MinimumRebalancingInterval = TimeSpan.FromMinutes(2),
+                ConnectTimeout = TimeSpan.FromMinutes(1),
+                SessionTimeout = TimeSpan.FromMinutes(1)
+            };
+            
+            this.currentConfig = config;
+            Providers.Register(GetGlobalBarrierProvider);
+            
+            await RandomisedReleaseBarrierTest(config);
+        }
+        
+        [Fact]
+        public async Task ResourceBarrier_RandomisedReleaseBarrierTest_ShortRandomInterval_MediumClient_MediumResource_ConditionalCheck()
         {
             // the wait period is set quite high as running the test long enough
             // can induce a scenario similar to:
@@ -117,11 +251,43 @@ namespace Rebalanser.ZooKeeper.Tests.RandomisedTests
                 ConditionalCheckWaitPeriod = TimeSpan.FromMinutes(2)
             };
             
+            this.currentConfig = config;
+            Providers.Register(GetResourceBarrierProvider);
+            
             await RandomisedReleaseBarrierTest(config);
         }
         
         [Fact]
-        public async Task RandomisedReleaseBarrierTest_ShortInterval_LowClient_LowResource_DoubleAssignmentCheck()
+        public async Task GlobalBarrier_RandomisedReleaseBarrierTest_ShortRandomInterval_MediumClient_MediumResource_ConditionalCheck()
+        {
+            // the wait period is set quite high as running the test long enough
+            // can induce a scenario similar to:
+            // a very short interval causes an in progress rebalancing to cancel
+            // once cancelled the new rebalancing commences, then during this new rebalancing,
+            // a session expired event happens towards the end causing the cancellation of the current
+            // rebalancing, this rebalancing #3 is still in progress 60 seconds after the
+            // the sub second wait period, causing the "all resources assigned" check to fail
+            
+            var config = new RandomConfig()
+            {
+                ClientCount = 10,
+                ResourceCount = 60,
+                TestDuration = TimeSpan.FromMinutes(120),
+                MaxInterval = TimeSpan.FromSeconds(10),
+                RandomiseInterval = true,
+                CheckType = CheckType.ConditionalCheck,
+                ConditionalCheckInterval = 5,
+                ConditionalCheckWaitPeriod = TimeSpan.FromMinutes(2)
+            };
+            
+            this.currentConfig = config;
+            Providers.Register(GetGlobalBarrierProvider);
+            
+            await RandomisedReleaseBarrierTest(config);
+        }
+        
+        [Fact]
+        public async Task ResourceBarrier_RandomisedReleaseBarrierTest_ShortInterval_LowClient_LowResource_DoubleAssignmentCheck()
         {
             var config = new RandomConfig()
             {
@@ -132,6 +298,9 @@ namespace Rebalanser.ZooKeeper.Tests.RandomisedTests
                 RandomiseInterval = false,
                 CheckType = CheckType.DoubleAssignmentCheck
             };
+            
+            this.currentConfig = config;
+            Providers.Register(GetResourceBarrierProvider);
             
             await RandomisedReleaseBarrierTest(config);
         }
@@ -151,9 +320,6 @@ namespace Rebalanser.ZooKeeper.Tests.RandomisedTests
                 resourceMonitor.CreateResource($"res{i}");
                 resSuffixes.Add(i);
             }
-
-            this.currentConfig = config;
-            Providers.Register(GetProvider);
 
             var clientOptions = new ClientOptions()
             {
@@ -269,7 +435,7 @@ namespace Rebalanser.ZooKeeper.Tests.RandomisedTests
                 await clients[i].StopAsync();
         }
         
-        private IRebalanserProvider GetProvider()
+        private IRebalanserProvider GetResourceBarrierProvider()
         {
             return new ZooKeeperProvider(ZkHelper.ZooKeeperHosts, 
                 "/rebalanser", 
@@ -277,6 +443,17 @@ namespace Rebalanser.ZooKeeper.Tests.RandomisedTests
                 this.currentConfig.ConnectTimeout,
                 this.currentConfig.MinimumRebalancingInterval,
                 RebalancingMode.ResourceBarrier,
+                new TestOutputLogger());
+        }
+        
+        private IRebalanserProvider GetGlobalBarrierProvider()
+        {
+            return new ZooKeeperProvider(ZkHelper.ZooKeeperHosts, 
+                "/rebalanser", 
+                this.currentConfig.SessionTimeout,    
+                this.currentConfig.ConnectTimeout,
+                this.currentConfig.MinimumRebalancingInterval,
+                RebalancingMode.GlobalBarrier,
                 new TestOutputLogger());
         }
         

@@ -57,9 +57,16 @@ namespace Rebalanser.ZooKeeper.ResourceManagement
             }
         }
 
+        public bool IsInStartedState()
+        {
+            return AssignmentStatus == AssignmentStatus.ResourcesAssigned ||
+                   AssignmentStatus == AssignmentStatus.NoResourcesAssigned;
+        }
+
         public async Task InvokeOnStopActionsAsync(string clientId, string role)
         {
             await semaphoreSlim.WaitAsync();
+            
             try
             {
                 var resourcesToRemove = new List<string>(this.resources);
@@ -116,12 +123,9 @@ namespace Rebalanser.ZooKeeper.ResourceManagement
                     
                     this.resources.Clear();
                     this.logger.Info(clientId, $"{role} - On stop complete");
-                    AssignmentStatus = AssignmentStatus.ResourcesAssigned;
                 }
-                else
-                {
-                    AssignmentStatus = AssignmentStatus.NoResourcesAssigned;
-                }
+                
+                AssignmentStatus = AssignmentStatus.NoAssignmentYet;
             }
             finally
             {
@@ -136,6 +140,10 @@ namespace Rebalanser.ZooKeeper.ResourceManagement
             CancellationToken clientToken)
         {
             await semaphoreSlim.WaitAsync();
+
+            if (IsInStartedState())
+                throw new InconsistentStateException("An attempt to invoke on start actions occurred while already in the started state");
+            
             try
             {
                 this.resources = new List<string>(newResources);
@@ -231,6 +239,11 @@ namespace Rebalanser.ZooKeeper.ResourceManagement
                     }
                     
                     this.logger.Info(clientId, $"{role} - On start complete");
+                    AssignmentStatus = AssignmentStatus.ResourcesAssigned;
+                }
+                else
+                {
+                    AssignmentStatus = AssignmentStatus.NoResourcesAssigned;
                 }
             }
             finally

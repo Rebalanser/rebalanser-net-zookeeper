@@ -436,14 +436,14 @@ namespace Rebalanser.ZooKeeper
             ICoordinator coordinator;
             switch (this.rebalancingMode)
             {
-                //case RebalancingMode.GlobalBarrier:
-//                    coordinator = new GB.Coordinator(this.zooKeeperService,
-//                        this.logger,
-//                        this.store,
-//                        onChangeActions,
-//                        this.clientId,
-//                        token);
-                    //break;
+                case RebalancingMode.GlobalBarrier:
+                    coordinator = new GB.Coordinator(this.zooKeeperService,
+                        this.logger,
+                        this.store,
+                        this.clientId,
+                        this.minimumRebalancingInterval,
+                        token);
+                    break;
                 case RebalancingMode.ResourceBarrier:
                     coordinator = new RB.Coordinator(this.zooKeeperService,
                         this.logger,
@@ -489,15 +489,15 @@ namespace Rebalanser.ZooKeeper
             IFollower follower;
             switch (this.rebalancingMode)
             {
-//                case RebalancingMode.GlobalBarrier:
-//                    follower = new GB.Follower(this.zooKeeperService,
-//                        this.logger,
-//                        this.store,
-//                        this.clientId,
-//                        this.clientNumber,
-//                        this.watchSiblingNodePath,
-//                        token);
-//                    break;
+                case RebalancingMode.GlobalBarrier:
+                    follower = new GB.Follower(this.zooKeeperService,
+                        this.logger,
+                        this.store,
+                        this.clientId,
+                        this.clientNumber,
+                        this.watchSiblingNodePath,
+                        token);
+                    break;
                 case RebalancingMode.ResourceBarrier:
                     follower = new RB.Follower(this.zooKeeperService,
                         this.logger,

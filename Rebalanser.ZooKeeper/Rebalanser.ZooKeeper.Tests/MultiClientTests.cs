@@ -18,17 +18,29 @@ namespace Rebalanser.ZooKeeper.Tests
         {
             this.zkHelper = new ZkHelper();
         }
+
+
+        [Fact]
+        public async Task ResourceBarrier_GivenSixResourcesAndThreeClients_ThenEachClientGetsTwoResources()
+        {
+            Providers.Register(GetResourceBarrierProvider);
+            await GivenSixResourcesAndThreeClients_ThenEachClientGetsTwoResources();
+        }
         
         [Fact]
-        public async Task GivenSixResourcesAndThreeClients_ThenEachClientGetsTwoResources()
+        public async Task GlobalBarrier_GivenSixResourcesAndThreeClients_ThenEachClientGetsTwoResources()
+        {
+            Providers.Register(GetGlobalBarrierProvider);
+            await GivenSixResourcesAndThreeClients_ThenEachClientGetsTwoResources();
+        }
+        
+        private async Task GivenSixResourcesAndThreeClients_ThenEachClientGetsTwoResources()
         {
             // ARRANGE
             var groupName = Guid.NewGuid().ToString();
             await this.zkHelper.InitializeAsync("/rebalanser", TimeSpan.FromSeconds(20), TimeSpan.FromSeconds(30));
             await this.zkHelper.PrepareResourceGroupAsync(groupName, "res", 6);
 
-            Providers.Register(GetProvider);
-            
             // ACT
             var (client1, testEvents1) = CreateClient();
             var (client2, testEvents2) = CreateClient();
@@ -50,17 +62,28 @@ namespace Rebalanser.ZooKeeper.Tests
             await client2.StopAsync();
             await client3.StopAsync();
         }
+
+        [Fact]
+        public async Task ResourceBarrier_GivenMultipleResourcesAndThreeClientsAtStartWithClientsStoppingOneByOne_ThenResourceAssignmentsReassignedAccordingly()
+        {
+            Providers.Register(GetResourceBarrierProvider);
+            await GivenMultipleResourcesAndThreeClientsAtStartWithClientsStoppingOneByOne_ThenResourceAssignmentsReassignedAccordingly();
+        }
         
         [Fact]
-        public async Task GivenMultipleResourcesAndThreeClientsAtStartWithClientsStoppingOneByOne_ThenResourceAssignmentsReassignedAccordingly()
+        public async Task GlobalBarrier_GivenMultipleResourcesAndThreeClientsAtStartWithClientsStoppingOneByOne_ThenResourceAssignmentsReassignedAccordingly()
+        {
+            Providers.Register(GetGlobalBarrierProvider);
+            await GivenMultipleResourcesAndThreeClientsAtStartWithClientsStoppingOneByOne_ThenResourceAssignmentsReassignedAccordingly();
+        }
+        
+        private async Task GivenMultipleResourcesAndThreeClientsAtStartWithClientsStoppingOneByOne_ThenResourceAssignmentsReassignedAccordingly()
         {
             // ARRANGE
             var groupName = Guid.NewGuid().ToString();
             await this.zkHelper.InitializeAsync("/rebalanser", TimeSpan.FromSeconds(20), TimeSpan.FromSeconds(30));
             await this.zkHelper.PrepareResourceGroupAsync(groupName, "res", 6);
 
-            Providers.Register(GetProvider);
-            
             // ACT - start up three clients
             var (client1, testEvents1) = CreateClient();
             var (client2, testEvents2) = CreateClient();
@@ -102,17 +125,28 @@ namespace Rebalanser.ZooKeeper.Tests
             // clean up
             await client3.StopAsync();
         }
+
+        [Fact]
+        public async Task ResourceBarrier_GivenMultipleResourcesAndOneClientAtStartWithNewClientsStartingOneByOne_ThenResourceAssignmentsReassignedAccordingly()
+        {
+            Providers.Register(GetResourceBarrierProvider);
+            await GivenMultipleResourcesAndOneClientAtStartWithNewClientsStartingOneByOne_ThenResourceAssignmentsReassignedAccordingly();
+        }
         
         [Fact]
-        public async Task GivenMultipleResourcesAndOneClientAtStartWithNewClientsStartingOneByOne_ThenResourceAssignmentsReassignedAccordingly()
+        public async Task GlobalBarrier_GivenMultipleResourcesAndOneClientAtStartWithNewClientsStartingOneByOne_ThenResourceAssignmentsReassignedAccordingly()
+        {
+            Providers.Register(GetGlobalBarrierProvider);
+            await GivenMultipleResourcesAndOneClientAtStartWithNewClientsStartingOneByOne_ThenResourceAssignmentsReassignedAccordingly();
+        }
+        
+        private async Task GivenMultipleResourcesAndOneClientAtStartWithNewClientsStartingOneByOne_ThenResourceAssignmentsReassignedAccordingly()
         {
             // ARRANGE
             var groupName = Guid.NewGuid().ToString();
             await this.zkHelper.InitializeAsync("/rebalanser", TimeSpan.FromSeconds(20), TimeSpan.FromSeconds(30));
             await this.zkHelper.PrepareResourceGroupAsync(groupName, "res", 6);
 
-            Providers.Register(GetProvider);
-            
             // ACT - create three clients and start one
             var (client1, testEvents1) = CreateClient();
             var (client2, testEvents2) = CreateClient();
@@ -152,6 +186,217 @@ namespace Rebalanser.ZooKeeper.Tests
             // clean up
             await client1.StopAsync();
             await client2.StopAsync();
+            await client3.StopAsync();
+        }
+
+        [Fact]
+        public async Task ResourceBarrier_GivenOneResourceAndOneClient_ThenAdditionalClientsDoNotTriggerRebalancing()
+        {
+            Providers.Register(GetResourceBarrierProvider);
+            await GivenOneResourceAndOneClient_ThenAdditionalClientsDoNotTriggerRebalancing();
+        }
+        
+        [Fact]
+        public async Task GlobalBarrier_GivenOneResourceAndOneClient_ThenAdditionalClientsDoNotTriggerRebalancing()
+        {
+            Providers.Register(GetGlobalBarrierProvider);
+            await GivenOneResourceAndOneClient_ThenAdditionalClientsDoNotTriggerRebalancing();
+        }
+        
+        private async Task GivenOneResourceAndOneClient_ThenAdditionalClientsDoNotTriggerRebalancing()
+        {
+            // ARRANGE
+            var groupName = Guid.NewGuid().ToString();
+            await this.zkHelper.InitializeAsync("/rebalanser", TimeSpan.FromSeconds(20), TimeSpan.FromSeconds(30));
+            await this.zkHelper.PrepareResourceGroupAsync(groupName, "res", 1);
+
+            // ACT - create three clients and start one
+            var (client1, testEvents1) = CreateClient();
+            var (client2, testEvents2) = CreateClient();
+            var (client3, testEvents3) = CreateClient();
+
+            await client1.StartAsync(groupName, new ClientOptions() {AutoRecoveryOnError = false});
+            
+            await Task.Delay(TimeSpan.FromSeconds(10));
+            
+            // ASSERT - client 1 that has started has been assigned all resources
+            // but that clients 2 and 3 that have not started has been assigned nothing
+            AssertAssigned(testEvents1, 1);
+            AssertNoEvents(testEvents2);
+            AssertNoEvents(testEvents3);
+            
+            // ACT - start one client
+            await client2.StartAsync(groupName, new ClientOptions() {AutoRecoveryOnError = false});
+            
+            await Task.Delay(TimeSpan.FromSeconds(10));
+            
+            // ASSERT - no rebalancing occurs
+            AssertNoEvents(testEvents1);
+            AssertNoEvents(testEvents2);
+            AssertNoEvents(testEvents3);
+            
+            // ACT - start one client
+            await client3.StartAsync(groupName, new ClientOptions() {AutoRecoveryOnError = false});
+            
+            await Task.Delay(TimeSpan.FromSeconds(10));
+            
+            // ASSERT - no rebalancing occurs
+            AssertNoEvents(testEvents1);
+            AssertNoEvents(testEvents2);
+            AssertNoEvents(testEvents3);
+            
+            // ACT - stop one client
+            await client2.StopAsync();
+            
+            await Task.Delay(TimeSpan.FromSeconds(10));
+            
+            // ASSERT - no rebalancing occurs
+            AssertNoEvents(testEvents1);
+            AssertNoEvents(testEvents2);
+            AssertNoEvents(testEvents3);
+            
+            // clean up
+            await client1.StopAsync();
+            await client3.StopAsync();
+        }
+
+        [Fact]
+        public async Task ResourceBarrier_GivenTwoResourcesAndThreeClients_ThenRemovingUnassignedClientDoesNotTriggerRebalancing()
+        {
+            Providers.Register(GetResourceBarrierProvider);
+            await GivenTwoResourcesAndThreeClients_ThenRemovingUnassignedClientDoesNotTriggerRebalancing();
+        }
+        
+        [Fact]
+        public async Task GlobalBarrier_GivenTwoResourcesAndThreeClients_ThenRemovingUnassignedClientDoesNotTriggerRebalancing()
+        {
+            Providers.Register(GetGlobalBarrierProvider);
+            await GivenTwoResourcesAndThreeClients_ThenRemovingUnassignedClientDoesNotTriggerRebalancing();
+        }
+        
+        private async Task GivenTwoResourcesAndThreeClients_ThenRemovingUnassignedClientDoesNotTriggerRebalancing()
+        {
+            // ARRANGE
+            var groupName = Guid.NewGuid().ToString();
+            await this.zkHelper.InitializeAsync("/rebalanser", TimeSpan.FromSeconds(20), TimeSpan.FromSeconds(30));
+            await this.zkHelper.PrepareResourceGroupAsync(groupName, "res", 2);
+
+            // ACT - create three clients and start one
+            var (client1, testEvents1) = CreateClient();
+            var (client2, testEvents2) = CreateClient();
+            var (client3, testEvents3) = CreateClient();
+
+            await client1.StartAsync(groupName, new ClientOptions() {AutoRecoveryOnError = false});
+            await Task.Delay(TimeSpan.FromSeconds(10));
+            
+            // ASSERT - client 1 has started has each been assigned both resources
+            // but that clients 2 and 3 that have not started have been assigned nothing
+            AssertAssigned(testEvents1, 2);
+            AssertNoEvents(testEvents2);
+            AssertNoEvents(testEvents3);
+            
+            await client2.StartAsync(groupName, new ClientOptions() {AutoRecoveryOnError = false});
+            
+            await Task.Delay(TimeSpan.FromSeconds(10));
+            
+            // ASSERT - client 1 and 2 have started have each been assigned a resource
+            // but that clients 3 that has not started has been assigned nothing
+            AssertUnassignedThenAssigned(testEvents1, 1);
+            AssertAssigned(testEvents2, 1);
+            AssertNoEvents(testEvents3);
+            
+            // ACT - start client 3
+            await client3.StartAsync(groupName, new ClientOptions() {AutoRecoveryOnError = false});
+            
+            await Task.Delay(TimeSpan.FromSeconds(10));
+            
+            // ASSERT - no rebalancing occurs
+            AssertNoEvents(testEvents1);
+            AssertNoEvents(testEvents2);
+            AssertNoEvents(testEvents3);
+            
+            // ACT - remove client3
+            await client3.StopAsync();
+            
+            await Task.Delay(TimeSpan.FromSeconds(10));
+            
+            // ASSERT - no rebalancing occurs
+            AssertNoEvents(testEvents1);
+            AssertNoEvents(testEvents2);
+            AssertNoEvents(testEvents3);
+            
+            // clean up
+            await client1.StopAsync();
+            await client2.StopAsync();
+        }
+
+        [Fact]
+        public async Task ResourceBarrier_GivenTwoResourcesAndThreeClients_ThenRemovingAssignedClientDoesTriggerRebalancing()
+        {
+            Providers.Register(GetResourceBarrierProvider);
+            await GivenTwoResourcesAndThreeClients_ThenRemovingAssignedClientDoesTriggerRebalancing();
+        }
+        
+        [Fact]
+        public async Task GlobalBarrier_GivenTwoResourcesAndThreeClients_ThenRemovingAssignedClientDoesTriggerRebalancing()
+        {
+            Providers.Register(GetGlobalBarrierProvider);
+            await GivenTwoResourcesAndThreeClients_ThenRemovingAssignedClientDoesTriggerRebalancing();
+        }
+        
+        private async Task GivenTwoResourcesAndThreeClients_ThenRemovingAssignedClientDoesTriggerRebalancing()
+        {
+            // ARRANGE
+            var groupName = Guid.NewGuid().ToString();
+            await this.zkHelper.InitializeAsync("/rebalanser", TimeSpan.FromSeconds(20), TimeSpan.FromSeconds(30));
+            await this.zkHelper.PrepareResourceGroupAsync(groupName, "res", 2);
+
+            // ACT - create three clients and start one
+            var (client1, testEvents1) = CreateClient();
+            var (client2, testEvents2) = CreateClient();
+            var (client3, testEvents3) = CreateClient();
+
+            await client1.StartAsync(groupName, new ClientOptions() {AutoRecoveryOnError = false});
+            await Task.Delay(TimeSpan.FromSeconds(10));
+            
+            // ASSERT - client 1 has started has each been assigned both resources
+            // but that clients 2 and 3 that have not started have been assigned nothing
+            AssertAssigned(testEvents1, 2);
+            AssertNoEvents(testEvents2);
+            AssertNoEvents(testEvents3);
+            
+            await client2.StartAsync(groupName, new ClientOptions() {AutoRecoveryOnError = false});
+            
+            await Task.Delay(TimeSpan.FromSeconds(10));
+            
+            // ASSERT - client 1 and 2 have started have each been assigned a resource
+            // but that clients 3 that has not started has been assigned nothing
+            AssertUnassignedThenAssigned(testEvents1, 1);
+            AssertAssigned(testEvents2, 1);
+            AssertNoEvents(testEvents3);
+            
+            // ACT - start client 3
+            await client3.StartAsync(groupName, new ClientOptions() {AutoRecoveryOnError = false});
+            
+            await Task.Delay(TimeSpan.FromSeconds(10));
+            
+            // ASSERT - no rebalancing occurs
+            AssertNoEvents(testEvents1);
+            AssertNoEvents(testEvents2);
+            AssertNoEvents(testEvents3);
+            
+            // ACT - remove client2
+            await client2.StopAsync();
+            
+            await Task.Delay(TimeSpan.FromSeconds(10));
+            
+            // ASSERT - rebalancing occurs
+            AssertUnassignedThenAssigned(testEvents1, 1);
+            AssertUnassignedOnly(testEvents2);
+            AssertAssigned(testEvents3, 1);
+            
+            // clean up
+            await client1.StopAsync();
             await client3.StopAsync();
         }
 
@@ -218,7 +463,7 @@ namespace Rebalanser.ZooKeeper.Tests
             return (client1, testEvents);
         }
 
-        private IRebalanserProvider GetProvider()
+        private IRebalanserProvider GetResourceBarrierProvider()
         {
             return new ZooKeeperProvider(ZkHelper.ZooKeeperHosts, 
                 "/rebalanser", 
@@ -226,6 +471,17 @@ namespace Rebalanser.ZooKeeper.Tests
                 TimeSpan.FromSeconds(20),
                 TimeSpan.FromSeconds(5),
                 RebalancingMode.ResourceBarrier,
+                new TestOutputLogger());
+        }
+        
+        private IRebalanserProvider GetGlobalBarrierProvider()
+        {
+            return new ZooKeeperProvider(ZkHelper.ZooKeeperHosts, 
+                "/rebalanser", 
+                TimeSpan.FromSeconds(20),
+                TimeSpan.FromSeconds(20),
+                TimeSpan.FromSeconds(5),
+                RebalancingMode.GlobalBarrier,
                 new TestOutputLogger());
         }
 

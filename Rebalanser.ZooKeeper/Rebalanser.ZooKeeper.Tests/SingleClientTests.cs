@@ -21,21 +21,33 @@ namespace Rebalanser.ZooKeeper.Tests
         }
         
         [Fact]
-        public async Task GivenSingleClient_ThenGetsAllResourcesAssigned()
+        public async Task ResourceBarrier_GivenSingleClient_ThenGetsAllResourcesAssigned()
+        {
+            Providers.Register(GetResourceBarrierProvider);
+            await GivenSingleClient_ThenGetsAllResourcesAssigned();
+        }
+
+        [Fact]
+        public async Task GlobalBarrier_GivenSingleClient_ThenGetsAllResourcesAssigned()
+        {
+            Providers.Register(GetGlobalBarrierProvider);
+            await GivenSingleClient_ThenGetsAllResourcesAssigned();
+        }
+
+        private async Task GivenSingleClient_ThenGetsAllResourcesAssigned()
         {
             // ARRANGE
             var groupName = Guid.NewGuid().ToString();
             await this.zkHelper.InitializeAsync("/rebalanser", TimeSpan.FromSeconds(20), TimeSpan.FromSeconds(30));
             await this.zkHelper.PrepareResourceGroupAsync(groupName, "res", 5);
 
-            Providers.Register(GetProvider);
             var expectedAssignedResources = new List<string>() {"res0", "res1", "res2", "res3", "res4"};
             
             // ACT
             var (client, testEvents) = CreateClient();
             await client.StartAsync(groupName, new ClientOptions() {AutoRecoveryOnError = false});
 
-            await Task.Delay(TimeSpan.FromSeconds(15));
+            await Task.Delay(TimeSpan.FromSeconds(10));
             
             // ASSERT
             Assert.Equal(1, testEvents.Count);
@@ -83,7 +95,7 @@ namespace Rebalanser.ZooKeeper.Tests
             return expectedRes.OrderBy(x => x).SequenceEqual(actualRes.OrderBy(x => x));
         }
 
-        private IRebalanserProvider GetProvider()
+        private IRebalanserProvider GetResourceBarrierProvider()
         {
             return new ZooKeeperProvider(ZkHelper.ZooKeeperHosts, 
                 "/rebalanser", 
@@ -91,6 +103,17 @@ namespace Rebalanser.ZooKeeper.Tests
                 TimeSpan.FromSeconds(20),
                 TimeSpan.FromSeconds(5), 
                 RebalancingMode.ResourceBarrier,
+                new TestOutputLogger());
+        }
+        
+        private IRebalanserProvider GetGlobalBarrierProvider()
+        {
+            return new ZooKeeperProvider(ZkHelper.ZooKeeperHosts, 
+                "/rebalanser", 
+                TimeSpan.FromSeconds(20),
+                TimeSpan.FromSeconds(20),
+                TimeSpan.FromSeconds(5), 
+                RebalancingMode.GlobalBarrier,
                 new TestOutputLogger());
         }
 

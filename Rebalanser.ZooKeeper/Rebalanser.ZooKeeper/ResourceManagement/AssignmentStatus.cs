@@ -4,7 +4,6 @@ namespace Rebalanser.ZooKeeper.ResourceManagement
     {
         NoAssignmentYet,
         ResourcesAssigned,
-        NoResourcesAssigned,
-        AssignmentInProgress
+        NoResourcesAssigned
     }
 }

@@ -43,7 +43,7 @@ namespace Rebalanser.ZooKeeper.Zk
 
             await EnsurePathAsync(this.clientsPath);
             await EnsurePathAsync(this.epochPath);
-            await EnsurePathAsync(this.statusPath);
+            await EnsurePathAsync(this.statusPath, BitConverter.GetBytes((int)0));
             await EnsurePathAsync(this.stoppedPath);
             await EnsurePathAsync(this.resourcesPath);
         }
@@ -114,7 +114,7 @@ namespace Rebalanser.ZooKeeper.Zk
                         ZooDefs.Ids.OPEN_ACL_UNSAFE,
                         CreateMode.EPHEMERAL_SEQUENTIAL);
 
-                    this.clientId = clientPath.Substring(clientPath.LastIndexOf("/") + 1);
+                    this.clientId = clientPath.Substring(clientPath.LastIndexOf("/", StringComparison.Ordinal) + 1);
 
                     return clientPath;
                 }
@@ -169,7 +169,7 @@ namespace Rebalanser.ZooKeeper.Zk
             }
         }
 
-        public async Task EnsurePathAsync(string znodePath)
+        public async Task EnsurePathAsync(string znodePath, byte[] bytesToSet = null)
         {
             var actionToPerform = $"ensure path {znodePath}";
             bool succeeded = false;
@@ -182,8 +182,11 @@ namespace Rebalanser.ZooKeeper.Zk
                     var znodeStat = await this.zookeeper.existsAsync(znodePath);
                     if (znodeStat == null)
                     {
+                        if (bytesToSet == null)
+                            bytesToSet = System.Text.Encoding.UTF8.GetBytes("0");
+                        
                         await this.zookeeper.createAsync(znodePath,
-                            System.Text.Encoding.UTF8.GetBytes("0"),
+                            bytesToSet,
                             ZooDefs.Ids.OPEN_ACL_UNSAFE,
                             CreateMode.PERSISTENT);
                     }
