@@ -1,27 +1,27 @@
 # rebalanser-net-zookeeper
 ZooKeeper backend for .NET Rebalanser (in development). Protocol and implementation still under development.
 
-## Distributed Consensus of Resource Consumption Design
-Rebalanser.ZooKeeper is responsible for detecting changes to live clients and available resources and ensuring that all participating clients share the available resources equally.
+To learn more about the project check out the [wiki](https://github.com/Rebalanser/wiki/wiki).
+
+## Internals
+Rebalanser.ZooKeeper is .NET implementation of Rebalanser that uses ZooKeeper as the coordination service. 
 
 The design is split into two areas:
  - leader election
  - rebalancing after client or resources change.
 
-Both processes can occur at the same time, though on termination of the leader election any in progress rebalancing is aborted, in order to start a new one with a fresh view on the members of the group.
-
 The description below assumes knowledge of ZooKeeper concepts such as znodes and watches.
 
 Terminology:
-- client: a participating node that is consuming (reading/writing) resourcews
-- resource: a resource string identifier that clients use to identify the resources
-- coordinator: a client that also is responsible for initiating rebalancing and assigning resources
+- client: a participating node that is consuming (reading/writing) resources
+- resource: a resource string identifier that clients use to identify the resources such as queues, S3 buckets, files, socket connections etc.
+- coordinator: a client that is responsible for initiating rebalancing and assigning resources
 - follower: a client that responds to rebalancing events to stop and start consumption of resources as dictated by the coordinator.
 - resource group: a group of clients and resources
 - chroot: the root ZooKeeper path that a resource group owns
 
 ### Resource Management
-An administrator adds or removes resource identifiers to a resource group by creating/delete child znodes of the /chroot/group/resources znode. This does not affect the version number of the /chroot/group/resources znode which would cause a BadVersion error for the coordinator during a rebalancing. 
+An administrator adds or removes resource identifiers to a resource group by creating/deleting child znodes of the /chroot/group/resources znode. This does not affect the version number of the /chroot/group/resources znode which would cause a BadVersion error for the coordinator during a rebalancing. 
 
 ### Leader Election
 When a client starts it registers an ephemeral sequential znode under the /chroot/group/clients path. ZooKeeper appends a monotonically increasing counter to the end of path that is unique to that client. This will create a path such as /chroot/group/clients/client_0000000007. 
@@ -35,7 +35,7 @@ Then the coordinator places the following watches:
  - getChildren() /chroot/group/resources
  - getData() /chroot/group/epoch
 
-The clients and resources watches tell the leader when it needs to perform rebalancing. The epoch watch will notify the leader when a different client also got elected leader. This causes the current leader to stop, close its session and start a new one as a follower.
+The clients and resources watches tell the leader when it needs to perform rebalancing. The epoch watch will notify the coordinator if a different client also got elected leader. This causes the current leader to stop, close its session and start a new one as a follower. This way we avoid two active coordinators.
 
 Once a follower, a client sets a watch on the next lowest client znode. When a notification fires for that client it gets all children of the clients/ znode and if it has the smallest sequence number it is the coordinator, else it finds the next lowest znode, places a watch on it and continues to be a follower.
 
@@ -46,12 +46,12 @@ In addition to the coordinator detecting that another client was elected coordin
 ### Rebalancing Algorithms
 There are many possible algorithms and two are being implemented: Resource Barrier and Global Barrier. 
 
-The Resource Barrier algorithm ensures that no resource can be consumed concurrently by two or more clients by placing barriers on individual resources. The pros of this algorithm are its simplicity and the negative is that it requires two RPCs per resource which may not be suitable for resource groups with thousands of resources.
+The Resource Barrier algorithm ensures that no resource can be consumed concurrently by two or more clients by placing barriers on individual resources. The pros of this algorithm are its simplicity and speed, and the negative is that it requires two RPCs per resource which may not be suitable for resource groups with hundreds to thousands of resources.
 
-The Global Barrier algorithm ensures that no resource can be consumed concurrently by two or more clients by creating a start/stop command mechanism and a global barrier that ensures that all clients stop resource consumption before new resources are assigned. The pros of this algorithm are that it has the same number of RPCs regardless of the number of resources. The cons are that it is a more complex, slower algorithm.
+The Global Barrier algorithm ensures that no resource can be consumed concurrently by two or more clients by creating a start/stop command mechanism and a global barrier that ensures that all clients stop resource consumption before new resources are assigned. The pros of this algorithm are that it has the same number of RPCs regardless of the number of resources. The cons are that it is a more complex, slower algorithm (except for when there are hundreds to thousands of resources).
 
 #### Resource Barrier Algorithm
-Total RPCs. No of clients=C. No of resources=R. Number of stopped polling=P.
+Total RPCs. No of clients=C. No of resources=R.
 - /clients: 1 GetChildren()
 - /resources: 1 GetChildren(), 1 SetData(), 2xR SetData()
 
@@ -76,7 +76,7 @@ Note that the coordinator also performs steps 6, 8, 9 and 10 as the coordinator 
 
 ![](https://github.com/Rebalanser/rebalanser-net-zookeeper/blob/master/images/ResourceBarrier_Rebalancing.png)
 
-This algorithm is asynchronous and the coordinator does not know when all resources have been handed over to their new owners. If any client (coordinator or follower) dies during the process then a new rebalancing will be started and the current one aborted.
+This algorithm is asynchronous and the coordinator does not know when all followers have started consuming their resources. If any client (coordinator or follower) dies during the process then a new rebalancing will be started and the current one aborted. This was we avoid stuck rebalancings.
 
 The following scenarios have been considered:
 - When a follower receives a /chroot/group/resources data notification midway through a rebalancing they abort the current process and start from step 6.
@@ -110,7 +110,7 @@ The steps in a rebalancing are as follows:
 11. Invoke OnStart event handler with resources matching its ClientId. This will execute user code to start consuming from/writing to these resources.
 12. Followers: Delete() ephemeral child node of /chroot/group/stopped
 13. Coordinator: Notifications received on /chroot/group/stopped.
-14. Coordinator: When no more child znodes exist, call SetData() "StartConfirmed" on /chroot/group/status
+14. Coordinator: When no more child znodes exist, logs the completion of the rebalancing
 
 ![](https://github.com/Rebalanser/rebalanser-net-zookeeper/blob/master/images/GlobalBarrier_Rebalancing.png)
 
@@ -121,4 +121,8 @@ Likewise, if any follower is lost midway through a rebalancing, the coordinator 
 To avoid disruptive rebalancing events during cluster start up and shutdown, rebalancing events are timed to occur with a minimum interval between them. This limits the number of rebalancings started and aborted during deployments.
 
 ## Testing
-Work on testing has not begun yet. Each algorithm will be tested under both normal and failure scenarios. Both algorithms will also be measured in terms of time required to rebalance.
+Rebalanser has two invariants:
+1. It will never ever assign a resource to more than one node 
+2. No resource will remain unassigned longer than X period of time. 
+
+The integration tests validate that invariant 1 holds no matter what and they test that invariant 2 holds given a minimum stability of the system. For example, I can overload the system, I can kill off parts of it, I can mess with the network, invariant 1 must always hold. Invariant 2 should hold as long as it is given sufficient stability where we should expect it to operate successfully. To test that I have a suite of integration tests that operate the distributed nodes in one process, with a physical ZooKeeper cluster. A second suite of tests not yet developed will deploy the nodes to multiple machines and stresses will be placed. Both invariants should hold and overall performance of the system should be reasonable.
