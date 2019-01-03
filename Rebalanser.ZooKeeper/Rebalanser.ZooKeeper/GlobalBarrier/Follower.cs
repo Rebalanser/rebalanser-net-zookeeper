@@ -299,6 +299,8 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
                     .Where(x => x.ClientId.Equals(this.clientId))
                     .Select(x => x.Resource)
                     .ToList();
+                
+                this.logger.Info(this.clientId, $"Follower - {assignedResources.Count} resources granted");
 
                 if (this.store.IsInStartedState())
                 {

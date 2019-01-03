@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Security.Cryptography.X509Certificates;
 using System.Threading;
 using System.Threading.Tasks;
 using org.apache.zookeeper;
@@ -320,6 +321,9 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
 
         private async Task<RebalancingResult> RebalanceAsync(CancellationToken rebalancingToken)
         {
+            // the clients and resources identified in the stop phase are the only
+            // ones taken into account during the rebalancing
+            
             var stopPhaseResult = await StopActivityPhaseAsync(rebalancingToken);
             if (stopPhaseResult.PhaseResult != RebalancingResult.Complete)
                 return stopPhaseResult.PhaseResult;
@@ -327,12 +331,13 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
             var assignPhaseResult = await AssignResourcesPhaseAsync(rebalancingToken, 
                 stopPhaseResult.ResourcesZnode,
                 stopPhaseResult.ClientsZnode);
-            if (assignPhaseResult.PhaseResult != RebalancingResult.Complete)
-                return assignPhaseResult.PhaseResult;
+            if (assignPhaseResult != RebalancingResult.Complete)
+                return assignPhaseResult;
 
-            var verifyPhaseResult = await VerifyStartedPhaseAsync(rebalancingToken);
-            if (verifyPhaseResult.PhaseResult != RebalancingResult.Complete)
-                return assignPhaseResult.PhaseResult;
+            var verifyPhaseResult = await VerifyStartedPhaseAsync(rebalancingToken,
+                stopPhaseResult.FollowerIds);
+            if (verifyPhaseResult != RebalancingResult.Complete)
+                return assignPhaseResult;
             
             return RebalancingResult.Complete;
         }
@@ -342,25 +347,28 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
             return clientPath.Substring(clientPath.LastIndexOf("/", StringComparison.Ordinal)+1);
         }
 
-        private async Task<RebalancingPhaseResult> StopActivityPhaseAsync(CancellationToken rebalancingToken)
+        private async Task<StopPhaseResult> StopActivityPhaseAsync(CancellationToken rebalancingToken)
         {
             this.logger.Info(this.clientId, "Coordinator - Get active clients and resources");
             var clients = await this.zooKeeperService.GetActiveClientsAsync();
-            var latestResources = await this.zooKeeperService.GetResourcesAsync(null, null);
+            var followerIds = clients.ClientPaths.Select(GetClientId).Where(x => x != this.clientId).ToList();
+            var resources = await this.zooKeeperService.GetResourcesAsync(null, null);
+            this.logger.Info(this.clientId, $"Coordinator - {followerIds.Count} followers in scope and {resources.Resources.Count} resources in scope");
+            this.logger.Info(this.clientId, $"Coordinator - Assign resources ({string.Join(",", resources.Resources)}) to clients ({string.Join(",", clients.ClientPaths.Select(GetClientId))})");
             
-            if (latestResources.Version != this.resourcesVersion)
+            if (resources.Version != this.resourcesVersion)
                 throw new ZkStaleVersionException("Resources znode version does not match expected value, indicates another client has been made coordinator and is executing a rebalancing.");
             
             if (rebalancingToken.IsCancellationRequested) 
-                return new RebalancingPhaseResult(RebalancingResult.Cancelled);
+                return new StopPhaseResult(RebalancingResult.Cancelled);
             
             // if no resources were changed and there are more clients than resources then check
             // to see if rebalancing is necessary. If existing assignments are still valid then
             // a new client or the loss of a client with no assignments need not trigger a rebalancing
-            if (!IsRebalancingRequired(clients, latestResources))
+            if (!IsRebalancingRequired(clients, resources))
             {
                 this.logger.Info(this.clientId, "Coordinator - No rebalancing required. No resource change. No change to existing assigned clients. More clients than resources.");
-                return new RebalancingPhaseResult(RebalancingResult.NotRequired);
+                return new StopPhaseResult(RebalancingResult.NotRequired);
             }
             
             logger.Info(this.clientId, "Coordinator - Command followers to stop");
@@ -368,7 +376,7 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
             status.Version = await this.zooKeeperService.SetStatus(status);
             
             if (rebalancingToken.IsCancellationRequested) 
-                return new RebalancingPhaseResult(RebalancingResult.Cancelled);
+                return new StopPhaseResult(RebalancingResult.Cancelled);
 
             await this.store.InvokeOnStopActionsAsync(this.clientId, "Coordinator");
             
@@ -377,23 +385,44 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
             {
                 var stopped = await this.zooKeeperService.GetStoppedAsync();
 
-                if (IsClientListMatch(clients.ClientPaths, stopped))
+                if (AreClientsStopped(followerIds, stopped))
+                {
+                    this.logger.Info(this.clientId, $"Coordinator - All {stopped.Count} in scope followers have stopped");
                     break;
+                }
                 else
-                    await WaitFor(1000); // try again in 1s
+                {
+                    // check that a client hasn't died mid-rebalancing, if so, trigger a new rebalancing and abort this one.
+                    // else wait and check again
+                    var latestClients = await this.zooKeeperService.GetActiveClientsAsync();
+                    var missingClients = GetMissing(followerIds, latestClients.ClientPaths);
+                    if (missingClients.Any())
+                    {
+                        this.logger.Info(this.clientId, $"Coordinator - {missingClients.Count} followers have disappeared. Missing: {string.Join(",", missingClients)}. Triggering new rebalancing.");
+                        this.events.Add(CoordinatorEvent.RebalancingTriggered);
+                        return new StopPhaseResult(RebalancingResult.Cancelled);
+                    }
+                    else
+                    {
+                        var pendingClientIds = GetMissing(followerIds, stopped);
+                        this.logger.Info(this.clientId, $"Coordinator - waiting for followers to stop: {string.Join(",", pendingClientIds)}");
+                        await WaitFor(2000); // try again in 1s
+                    }
+                }
             }
             
             if (rebalancingToken.IsCancellationRequested) 
-                return new RebalancingPhaseResult(RebalancingResult.Cancelled);
+                return new StopPhaseResult(RebalancingResult.Cancelled);
 
-            var phaseResult = new RebalancingPhaseResult(RebalancingResult.Complete);
-            phaseResult.ResourcesZnode = latestResources;
+            var phaseResult = new StopPhaseResult(RebalancingResult.Complete);
+            phaseResult.ResourcesZnode = resources;
             phaseResult.ClientsZnode = clients;
+            phaseResult.FollowerIds = followerIds;
             
             return phaseResult;
         }
 
-        private async Task<RebalancingPhaseResult> AssignResourcesPhaseAsync(CancellationToken rebalancingToken,
+        private async Task<RebalancingResult> AssignResourcesPhaseAsync(CancellationToken rebalancingToken,
             ResourcesZnode resources,
             ClientsZnode clients)
         {
@@ -419,7 +448,7 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
             this.resourcesVersion = await this.zooKeeperService.SetResourcesAsync(resources);
             
             if (rebalancingToken.IsCancellationRequested) 
-                return new RebalancingPhaseResult(RebalancingResult.Cancelled);
+                return RebalancingResult.Cancelled;
             
             this.status.RebalancingStatus = RebalancingStatus.ResourcesGranted;
             this.status.Version = await this.zooKeeperService.SetStatus(this.status);
@@ -428,43 +457,41 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
             await this.store.InvokeOnStartActionsAsync(this.clientId, "Coordinator", leaderAssignments, rebalancingToken, this.coordinatorToken);
             
             if (rebalancingToken.IsCancellationRequested) 
-                return new RebalancingPhaseResult(RebalancingResult.Cancelled);
+                return RebalancingResult.Cancelled;
             
-            var phaseResult = new RebalancingPhaseResult(RebalancingResult.Complete);
-            phaseResult.ResourcesZnode = resources;
-            phaseResult.ClientsZnode = clients;
-            
-            return phaseResult;
+            return RebalancingResult.Complete;
         }
 
-        private async Task<RebalancingPhaseResult> VerifyStartedPhaseAsync(CancellationToken rebalancingToken)
+        private async Task<RebalancingResult> VerifyStartedPhaseAsync(CancellationToken rebalancingToken,
+            IList<string> followerIds)
         {
             logger.Info(this.clientId, "Coordinator - Verify all followers have started");
             if (rebalancingToken.IsCancellationRequested) 
-                return new RebalancingPhaseResult(RebalancingResult.Cancelled);
+                return RebalancingResult.Cancelled;
             
             while (!rebalancingToken.IsCancellationRequested)
             {
                 var stopped = await this.zooKeeperService.GetStoppedAsync();
-                if (!stopped.Any())
+                var stoppedClientsInScope = GetPresentInBoth(followerIds, stopped);
+                if (!stoppedClientsInScope.Any())
                 {
                     break;
                 }
                 else
                 {
-                    this.logger.Info(this.clientId, $"Coordinator - {stopped.Count} remaining followers to start");
+                    this.logger.Info(this.clientId, $"Coordinator - Waiting for {stoppedClientsInScope.Count} remaining in scope followers to start");
                     await WaitFor(2000); // try again in 1s
                 }
             }
             
             if (rebalancingToken.IsCancellationRequested) 
-                return new RebalancingPhaseResult(RebalancingResult.Cancelled);
+                return RebalancingResult.Cancelled;
 
             logger.Info(this.clientId, "Coordinator - All followers confirm started");
             //status.RebalancingStatus = RebalancingStatus.StartConfirmed;
             //this.status.Version = await this.zooKeeperService.SetStatus(status);
             
-            return new RebalancingPhaseResult(RebalancingResult.Complete);
+            return RebalancingResult.Complete;
         }
         
         private bool IsRebalancingRequired(ClientsZnode clients, ResourcesZnode resources)
@@ -507,12 +534,28 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
             return false;
         }
         
-        private bool IsClientListMatch(List<string> clientPaths, List<string> stoppedPaths)
+        private bool AreClientsStopped(List<string> followerIds, List<string> stoppedPaths)
         {
-            var clientIds = clientPaths.Select(x => GetClientId(x)).Where(x => !x.Equals(this.clientId)).OrderBy(x => x);
-            var stoppedClientIds = stoppedPaths.Select(x => GetClientId(x)).OrderBy(x => x);
+            var stoppedClientIds = stoppedPaths.Select(x => GetClientId(x)).ToList();
 
-            return clientIds.SequenceEqual(stoppedClientIds);
+            // we only care that the clients that fall under the current rebalancing are included in the list of stopped nodes
+            // it is possible that since rebalancing started, a new client came online and saw the status change to stop activity
+            // and added its own stopped node. These we ignore.
+            return followerIds.Intersect(stoppedClientIds).Count() == followerIds.Count;
+        }
+        
+        private List<string> GetMissing(List<string> followerIds, List<string> clientPaths2)
+        {
+            var clientIds2 = clientPaths2.Select(x => GetClientId(x)).OrderBy(x => x).ToList();
+
+            return followerIds.Except(clientIds2).ToList();
+        }
+        
+        private List<string> GetPresentInBoth(IList<string> followerIds, List<string> clientPaths2)
+        {
+            var clientIds2 = clientPaths2.Select(x => GetClientId(x)).OrderBy(x => x).ToList();
+
+            return followerIds.Intersect(clientIds2).ToList();
         }
 
         
