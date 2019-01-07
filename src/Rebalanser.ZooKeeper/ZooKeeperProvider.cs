@@ -26,6 +26,7 @@ namespace Rebalanser.ZooKeeper
         private string resourceGroup;
         private TimeSpan sessionTimeout;
         private TimeSpan connectTimeout;
+        private TimeSpan onStartDelay;
         private object startLockObj = new object();
         private Random rand;
         
@@ -78,10 +79,9 @@ namespace Rebalanser.ZooKeeper
             }
             
             this.resourceManager = new ResourceManager(this.zooKeeperService, this.logger, onChangeActions, this.rebalancingMode);
-            this.resourceGroup = resourceGroup;
             SetStateToNoSession();
-
             this.resourceGroup = resourceGroup;
+            this.onStartDelay = clientOptions.OnAssignmentDelay;
 
             mainTask = Task.Run(async () => await RunStateMachine(token, clientOptions));
             await Task.Yield();
@@ -204,6 +204,7 @@ namespace Rebalanser.ZooKeeper
                 }
                 catch (ZkSessionExpiredException)
                 {
+                    this.logger.Info(this.clientId, "ZooKeeper session lost");
                     SetStateToNoSession();
                 }
                 catch (ZkOperationCancelledException)
@@ -455,6 +456,8 @@ namespace Rebalanser.ZooKeeper
                         this.resourceManager,
                         this.clientId,
                         this.minimumRebalancingInterval,
+                        TimeSpan.FromMilliseconds((int)this.sessionTimeout.TotalMilliseconds/3),
+                        this.onStartDelay,
                         token);
                     break;
                 case RebalancingMode.ResourceBarrier:
@@ -463,6 +466,8 @@ namespace Rebalanser.ZooKeeper
                         this.resourceManager,
                         this.clientId,
                         this.minimumRebalancingInterval,
+                        TimeSpan.FromMilliseconds((int)this.sessionTimeout.TotalMilliseconds/3),
+                        this.onStartDelay,
                         token);
                     break;
                 default:
@@ -471,6 +476,8 @@ namespace Rebalanser.ZooKeeper
                         this.resourceManager,
                         this.clientId,
                         this.minimumRebalancingInterval,
+                        TimeSpan.FromMilliseconds((int)this.sessionTimeout.TotalMilliseconds/3),
+                        this.onStartDelay,
                         token);
                     break;
             }
@@ -509,6 +516,8 @@ namespace Rebalanser.ZooKeeper
                         this.clientId,
                         this.clientNumber,
                         this.watchSiblingNodePath,
+                        TimeSpan.FromMilliseconds((int)this.sessionTimeout.TotalMilliseconds/3),
+                        this.onStartDelay,
                         token);
                     break;
                 case RebalancingMode.ResourceBarrier:
@@ -518,6 +527,8 @@ namespace Rebalanser.ZooKeeper
                         this.clientId,
                         this.clientNumber,
                         this.watchSiblingNodePath,
+                        TimeSpan.FromMilliseconds((int)this.sessionTimeout.TotalMilliseconds/3),
+                        this.onStartDelay,
                         token);
                     break;
                 default:
@@ -527,6 +538,8 @@ namespace Rebalanser.ZooKeeper
                         this.clientId,
                         this.clientNumber,
                         this.watchSiblingNodePath,
+                        TimeSpan.FromMilliseconds((int)this.sessionTimeout.TotalMilliseconds/3),
+                        this.onStartDelay,
                         token);
                     break;
             }

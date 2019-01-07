@@ -22,11 +22,18 @@ namespace Rebalanser.ZooKeeper.Zk
         private Event.KeeperState keeperState;
         private CancellationToken token;
         private string clientId;
+        private bool sessionExpired;
 
         public ZooKeeperService(string zookeeperHosts)
         {
             this.zookeeperHosts = zookeeperHosts;
             this.clientId = "-";
+            this.sessionExpired = false;
+        }
+
+        public void SessionExpired()
+        {
+            this.sessionExpired = true;
         }
         
         public async Task InitializeGlobalBarrierAsync(string clientsPath,
@@ -83,7 +90,10 @@ namespace Rebalanser.ZooKeeper.Zk
             while (this.keeperState != Event.KeeperState.SyncConnected && sw.Elapsed <= connectTimeout)
                 await Task.Delay(50);
 
-            return this.keeperState == Event.KeeperState.SyncConnected;
+            var connected = this.keeperState == Event.KeeperState.SyncConnected;
+            this.sessionExpired = !connected;
+
+            return connected;
         }
 
         public async Task CloseSessionAsync()
@@ -908,7 +918,7 @@ namespace Rebalanser.ZooKeeper.Zk
 
         private async Task BlockUntilConnected(string logAction)
         {
-            while (!this.token.IsCancellationRequested && this.keeperState != Event.KeeperState.SyncConnected)
+            while (!this.sessionExpired && !this.token.IsCancellationRequested && this.keeperState != Event.KeeperState.SyncConnected)
             {
                 if(this.keeperState == Event.KeeperState.Expired)
                     throw new ZkSessionExpiredException($"Could not {logAction} because the session has expired");
@@ -918,24 +928,11 @@ namespace Rebalanser.ZooKeeper.Zk
 
             if (this.token.IsCancellationRequested)
                 throw new ZkOperationCancelledException($"Could not {logAction} because the operation was cancelled");
+            
+            if(this.sessionExpired || this.keeperState == Event.KeeperState.Expired)
+                throw new ZkSessionExpiredException($"Could not {logAction} because the session has expired");
         }
         
-        private async Task BlockUntilConnected(string logAction, CancellationToken waitingToken)
-        {
-            while (!this.token.IsCancellationRequested
-                   && !waitingToken.IsCancellationRequested
-                   && this.keeperState != Event.KeeperState.SyncConnected)
-            {
-                if(this.keeperState == Event.KeeperState.Expired)
-                    throw new ZkSessionExpiredException($"Could not {logAction} because the session has expired");
-                
-                await WaitFor(TimeSpan.FromMilliseconds(100));
-            }
-
-            if (this.token.IsCancellationRequested || waitingToken.IsCancellationRequested)
-                throw new ZkOperationCancelledException($"Could not {logAction} because the operation was cancelled");
-        }
-
         private async Task WaitFor(TimeSpan waitPeriod)
         {
             try

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -20,9 +21,11 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
         private ResourceManager store;
         
         // immutable state
-        private string clientId;
-        private int clientNumber;
+        private readonly string clientId;
+        private readonly int clientNumber;
         private CancellationToken followerToken;
+        private readonly TimeSpan sessionTimeout;
+        private readonly TimeSpan onStartDelay;
         
         // mutable state
         private string watchSiblingPath;
@@ -32,6 +35,7 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
         private CancellationTokenSource rebalancingCts;
         private BlockingCollection<FollowerEvent> events;
         private bool ignoreWatches;
+        private Stopwatch disconnectedTimer;
         
         public Follower(IZooKeeperService zooKeeperService,
             ILogger logger,
@@ -39,6 +43,8 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
             string clientId,
             int clientNumber,
             string watchSiblingPath,
+            TimeSpan sessionTimeout,
+            TimeSpan onStartDelay,
             CancellationToken followerToken)
         {
             this.zooKeeperService = zooKeeperService;
@@ -48,10 +54,13 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
             this.clientNumber = clientNumber;
             this.watchSiblingPath = watchSiblingPath;
             this.siblingId = watchSiblingPath.Substring(watchSiblingPath.LastIndexOf("/", StringComparison.Ordinal));
+            this.sessionTimeout = sessionTimeout;
+            this.onStartDelay = onStartDelay;
             this.followerToken = followerToken;
             
             this.rebalancingCts = new CancellationTokenSource();
             this.events = new BlockingCollection<FollowerEvent>();
+            this.disconnectedTimer = new Stopwatch();
         }
         
         // Important that nothing throws an exception in this method as it is called from the zookeeper library
@@ -71,9 +80,14 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
                     this.events.Add(FollowerEvent.SessionExpired);
                     break;
                 case Event.KeeperState.Disconnected:
+                    if(!this.disconnectedTimer.IsRunning)
+                        this.disconnectedTimer.Start();
                     break;
                 case Event.KeeperState.ConnectedReadOnly:
                 case Event.KeeperState.SyncConnected:
+                    if(this.disconnectedTimer.IsRunning)
+                        this.disconnectedTimer.Reset();
+                    
                     if (@event.get_Type() == Event.EventType.NodeDeleted)
                     {
                         if (@event.getPath().EndsWith(this.siblingId))
@@ -135,12 +149,20 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
             
             while (!this.followerToken.IsCancellationRequested)
             {
+                if (this.disconnectedTimer.IsRunning && this.disconnectedTimer.Elapsed > this.sessionTimeout)
+                {
+                    this.zooKeeperService.SessionExpired();
+                    await CleanUpAsync();
+                    return FollowerExitReason.SessionExpired;
+                }
+                
                 FollowerEvent followerEvent;
                 if (this.events.TryTake(out followerEvent))
                 {
                     switch (followerEvent)
                     {
                         case FollowerEvent.SessionExpired:
+                            this.zooKeeperService.SessionExpired();
                             await CleanUpAsync();
                             return FollowerExitReason.SessionExpired;
 
@@ -179,7 +201,7 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
                     }
                 }
 
-                await WaitFor(1000);
+                await WaitFor(TimeSpan.FromSeconds(1));
             }
 
             if (this.followerToken.IsCancellationRequested)
@@ -273,7 +295,7 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
             if(status.Version != this.statusVersion)
                 this.logger.Warn(this.clientId, "Follower - The status has changed between the notification and response");
             
-            if (this.followerToken.IsCancellationRequested)
+            if (rebalancingToken.IsCancellationRequested)
                 return RebalancingResult.Cancelled;
                 
             if (status.RebalancingStatus == RebalancingStatus.StopActivity)
@@ -281,7 +303,7 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
                 this.logger.Info(this.clientId, "Follower - Status change received - stop activity");
                 await this.store.InvokeOnStopActionsAsync(this.clientId, "Follower");
                 
-                if (this.followerToken.IsCancellationRequested)
+                if (rebalancingToken.IsCancellationRequested)
                     return RebalancingResult.Cancelled;
                 
                 await this.zooKeeperService.SetFollowerAsStopped(this.clientId);
@@ -305,12 +327,18 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
                     await this.store.InvokeOnStopActionsAsync(this.clientId, "Follower");
                 }
                 
-                if (this.followerToken.IsCancellationRequested)
+                if (this.onStartDelay.Ticks > 0)
+                {
+                    this.logger.Info(this.clientId, $"Follower - Delaying on start for {(int)this.onStartDelay.TotalMilliseconds}ms");
+                    await WaitFor(this.onStartDelay, rebalancingToken);
+                }
+                
+                if (rebalancingToken.IsCancellationRequested)
                     return RebalancingResult.Cancelled;
                 
                 await this.store.InvokeOnStartActionsAsync(this.clientId, "Follower", assignedResources, rebalancingToken, this.followerToken);
                 
-                if (this.followerToken.IsCancellationRequested)
+                if (rebalancingToken.IsCancellationRequested)
                     return RebalancingResult.Cancelled;
                 
                 await this.zooKeeperService.SetFollowerAsStarted(this.clientId);
@@ -360,11 +388,21 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
             }
         }
 
-        private async Task WaitFor(int milliseconds)
+        private async Task WaitFor(TimeSpan waitPeriod)
         {
             try
             {
-                await Task.Delay(milliseconds, this.followerToken);
+                await Task.Delay(waitPeriod, this.followerToken);
+            }
+            catch (TaskCanceledException)
+            {}
+        }
+        
+        private async Task WaitFor(TimeSpan waitPeriod, CancellationToken rebalancingToken)
+        {
+            try
+            {
+                await Task.Delay(waitPeriod, rebalancingToken);
             }
             catch (TaskCanceledException)
             {}
@@ -409,7 +447,7 @@ namespace Rebalanser.ZooKeeper.GlobalBarrier
                 {
                     // do nothing except wait, the next iteration will find
                     // another client or it wil detect that it itself is the new leader
-                    await WaitFor(1000);
+                    await WaitFor(TimeSpan.FromSeconds(1));
                 }
                 catch (ZkSessionExpiredException)
                 {

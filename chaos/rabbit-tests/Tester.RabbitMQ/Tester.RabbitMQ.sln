@@ -1,0 +1,22 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Tester.RabbitMQ", "Tester.RabbitMQ\Tester.RabbitMQ.csproj", "{34083C6B-4EB4-4C2C-9BF7-CC01394E74A8}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "QueueConfig", "QueueConfig\QueueConfig.csproj", "{6D3F3744-D18C-41CA-AA95-4BFC0C91C822}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{34083C6B-4EB4-4C2C-9BF7-CC01394E74A8}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{34083C6B-4EB4-4C2C-9BF7-CC01394E74A8}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{34083C6B-4EB4-4C2C-9BF7-CC01394E74A8}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{34083C6B-4EB4-4C2C-9BF7-CC01394E74A8}.Release|Any CPU.Build.0 = Release|Any CPU
+		{6D3F3744-D18C-41CA-AA95-4BFC0C91C822}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{6D3F3744-D18C-41CA-AA95-4BFC0C91C822}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{6D3F3744-D18C-41CA-AA95-4BFC0C91C822}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{6D3F3744-D18C-41CA-AA95-4BFC0C91C822}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal

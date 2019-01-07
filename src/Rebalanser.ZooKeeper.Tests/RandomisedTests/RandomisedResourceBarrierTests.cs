@@ -310,6 +310,50 @@ namespace Rebalanser.ZooKeeper.Tests.RandomisedTests
         }
         
         [Fact]
+        public async Task ResourceBarrier_RandomisedTest_ShortRandomInterval_MediumClient_MediumResource_OnAssignmentDelay_ConditionalCheck()
+        {
+            var config = new RandomConfig()
+            {
+                ClientCount = 10,
+                ResourceCount = 60,
+                TestDuration = TimeSpan.FromMinutes(120),
+                MaxInterval = TimeSpan.FromSeconds(10),
+                RandomiseInterval = true,
+                CheckType = CheckType.ConditionalCheck,
+                ConditionalCheckInterval = 5,
+                ConditionalCheckWaitPeriod = TimeSpan.FromMinutes(2),
+                OnAssignmentDelay = TimeSpan.FromSeconds(30)
+            };
+            
+            this.currentConfig = config;
+            Providers.Register(GetResourceBarrierProvider);
+            
+            await RandomisedTest(config);
+        }
+        
+        [Fact]
+        public async Task GlobalBarrier_RandomisedTest_ShortRandomInterval_MediumClient_MediumResource_OnAssignmentDelay_ConditionalCheck()
+        {
+            var config = new RandomConfig()
+            {
+                ClientCount = 10,
+                ResourceCount = 60,
+                TestDuration = TimeSpan.FromMinutes(120),
+                MaxInterval = TimeSpan.FromSeconds(10),
+                RandomiseInterval = true,
+                CheckType = CheckType.ConditionalCheck,
+                ConditionalCheckInterval = 5,
+                ConditionalCheckWaitPeriod = TimeSpan.FromMinutes(2),
+                OnAssignmentDelay = TimeSpan.FromSeconds(30)
+            };
+            
+            this.currentConfig = config;
+            Providers.Register(GetGlobalBarrierProvider);
+            
+            await RandomisedTest(config);
+        }
+        
+        [Fact]
         public async Task ResourceBarrier_RandomisedTest_ShortInterval_LowClient_LowResource_DoubleAssignmentCheck()
         {
             var config = new RandomConfig()
@@ -373,7 +417,8 @@ namespace Rebalanser.ZooKeeper.Tests.RandomisedTests
             var clientOptions = new ClientOptions()
             {
                 AutoRecoveryOnError = true, 
-                RestartDelay = TimeSpan.FromSeconds(10)
+                RestartDelay = TimeSpan.FromSeconds(10),
+                OnAssignmentDelay = config.OnAssignmentDelay
             };
             
             var clients = new List<TestClient>();

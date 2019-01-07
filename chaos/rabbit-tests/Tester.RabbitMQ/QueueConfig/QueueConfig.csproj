@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <TargetFramework>netcoreapp2.1</TargetFramework>
+    </PropertyGroup>
+
+    <ItemGroup>
+      <PackageReference Include="Newtonsoft.Json" Version="12.0.1" />
+      <PackageReference Include="ZooKeeperNetEx" Version="3.4.12.1" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <Reference Include="Rebalanser.ZooKeeper, Version=0.3.0.0, Culture=neutral, PublicKeyToken=null">
+        <HintPath>..\..\..\..\..\..\..\..\.nuget\packages\rebalanser.zookeeper\0.3.0\lib\netstandard2.0\Rebalanser.ZooKeeper.dll</HintPath>
+      </Reference>
+    </ItemGroup>
+
+</Project>

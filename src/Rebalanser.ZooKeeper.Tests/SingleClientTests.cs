@@ -26,7 +26,7 @@ namespace Rebalanser.ZooKeeper.Tests
             Providers.Register(GetResourceBarrierProvider);
             await GivenSingleClient_ThenGetsAllResourcesAssigned();
         }
-
+        
         [Fact]
         public async Task GlobalBarrier_GivenSingleClient_ThenGetsAllResourcesAssigned()
         {

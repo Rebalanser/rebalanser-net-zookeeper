@@ -24,6 +24,8 @@ namespace Rebalanser.ZooKeeper.ResourceBarrier
         private readonly CancellationToken coordinatorToken;
         private readonly string clientId;
         private readonly TimeSpan minimumRebalancingInterval;
+        private readonly TimeSpan sessionTimeout;
+        private readonly TimeSpan onStartDelay;
         
         // mutable state
         private Task rebalancingTask;
@@ -32,12 +34,15 @@ namespace Rebalanser.ZooKeeper.ResourceBarrier
         private BlockingCollection<CoordinatorEvent> events;
         private bool ignoreWatches;
         private RebalancingResult? lastRebalancingResult;
+        private Stopwatch disconnectedTimer;
 
         public Coordinator(IZooKeeperService zooKeeperService,
             ILogger logger,
             ResourceManager store,
             string clientId,
             TimeSpan minimumRebalancingInterval,
+            TimeSpan sessionTimeout,
+            TimeSpan onStartDelay,
             CancellationToken coordinatorToken)
         {
             this.zooKeeperService = zooKeeperService;
@@ -45,10 +50,13 @@ namespace Rebalanser.ZooKeeper.ResourceBarrier
             this.store = store;
             this.clientId = clientId;
             this.minimumRebalancingInterval = minimumRebalancingInterval;
+            this.sessionTimeout = sessionTimeout;
+            this.onStartDelay = onStartDelay;
             this.coordinatorToken = coordinatorToken;
             
             this.rebalancingCts = new CancellationTokenSource();
             this.events = new BlockingCollection<CoordinatorEvent>();
+            this.disconnectedTimer = new Stopwatch();
         }
         
         // very important that this method does not throw any exceptions as it is called from the zookeeper library
@@ -68,9 +76,14 @@ namespace Rebalanser.ZooKeeper.ResourceBarrier
                     this.events.Add(CoordinatorEvent.SessionExpired);
                     break;
                 case Event.KeeperState.Disconnected:
+                    if(!this.disconnectedTimer.IsRunning)
+                        this.disconnectedTimer.Start();
                     break;
                 case Event.KeeperState.ConnectedReadOnly:
                 case Event.KeeperState.SyncConnected:
+                    if(this.disconnectedTimer.IsRunning)
+                        this.disconnectedTimer.Reset();
+                    
                     if (@event.getPath() != null)
                     {
                         if(@event.get_Type() == Event.EventType.NodeDataChanged)
@@ -130,12 +143,20 @@ namespace Rebalanser.ZooKeeper.ResourceBarrier
             
             while (!this.coordinatorToken.IsCancellationRequested)
             {
+                if (this.disconnectedTimer.IsRunning && this.disconnectedTimer.Elapsed > this.sessionTimeout)
+                {
+                    this.zooKeeperService.SessionExpired();
+                    await CleanUpAsync();
+                    return CoordinatorExitReason.SessionExpired;
+                }
+                
                 CoordinatorEvent coordinatorEvent;
                 if (this.events.TryTake(out coordinatorEvent))
                 {
                     switch (coordinatorEvent)
                     {
                         case CoordinatorEvent.SessionExpired:
+                            this.zooKeeperService.SessionExpired();
                             await CleanUpAsync();
                             return CoordinatorExitReason.SessionExpired;
                         
@@ -178,7 +199,7 @@ namespace Rebalanser.ZooKeeper.ResourceBarrier
                     }
                 }
 
-                await WaitFor(1000);
+                await WaitFor(TimeSpan.FromSeconds(1));
             }
 
             if (this.coordinatorToken.IsCancellationRequested)
@@ -223,11 +244,21 @@ namespace Rebalanser.ZooKeeper.ResourceBarrier
             }
         }
 
-        private async Task WaitFor(int milliseconds)
+        private async Task WaitFor(TimeSpan waitPeriod)
         {
             try
             {
-                await Task.Delay(milliseconds, this.coordinatorToken);
+                await Task.Delay(waitPeriod, this.coordinatorToken);
+            }
+            catch (TaskCanceledException)
+            {}
+        }
+        
+        private async Task WaitFor(TimeSpan waitPeriod, CancellationToken rebalancingToken)
+        {
+            try
+            {
+                await Task.Delay(waitPeriod, rebalancingToken);
             }
             catch (TaskCanceledException)
             {}
@@ -351,8 +382,17 @@ namespace Rebalanser.ZooKeeper.ResourceBarrier
             
             if (rebalancingToken.IsCancellationRequested) 
                 return RebalancingResult.Cancelled;
-            
+
             await this.store.InvokeOnStopActionsAsync(this.clientId, "Coordinator");
+            if (rebalancingToken.IsCancellationRequested) 
+                return RebalancingResult.Cancelled;
+            
+            if (this.onStartDelay.Ticks > 0)
+            {
+                this.logger.Info(this.clientId, $"Coordinator - Delaying on start for {(int)this.onStartDelay.TotalMilliseconds}ms");
+                await WaitFor(this.onStartDelay, rebalancingToken);
+            }
+            
             if (rebalancingToken.IsCancellationRequested) 
                 return RebalancingResult.Cancelled;
             

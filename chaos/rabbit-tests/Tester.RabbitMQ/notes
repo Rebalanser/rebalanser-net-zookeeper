@@ -1,0 +1,7 @@
+cd /home/jack/editor/git/github/rebalanser-net-zookeeper/chaos/rabbitmq-consumer-test/Tester.RabbitMQ/Tester.RabbitMQ/bin/Debug/netcoreapp2.1
+
+dotnet Tester.RabbitMQ.dll --Mode output --Queue output-seq
+
+dotnet Tester.RabbitMQ.dll --Mode consume --Group group --OutQueue output-seq
+
+dotnet Tester.RabbitMQ.dll --Mode publish --Exchange input-seq --Keys 10 --Messages 100

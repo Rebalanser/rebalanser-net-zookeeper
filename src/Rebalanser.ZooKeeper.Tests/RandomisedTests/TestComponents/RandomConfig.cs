@@ -13,6 +13,7 @@ namespace Rebalanser.ZooKeeper.Tests.RandomisedTests.TestComponents
             OnStartEventHandlerTime = TimeSpan.Zero;
             OnStopEventHandlerTime = TimeSpan.Zero;
             RandomiseEventHandlerTimes = false;
+            OnAssignmentDelay = TimeSpan.Zero;
         }
         
         public TimeSpan SessionTimeout { get; set; }
@@ -29,6 +30,7 @@ namespace Rebalanser.ZooKeeper.Tests.RandomisedTests.TestComponents
         public TimeSpan ConditionalCheckWaitPeriod { get; set; }
         public TimeSpan OnStartEventHandlerTime { get; set; }
         public TimeSpan OnStopEventHandlerTime { get; set; }
+        public TimeSpan OnAssignmentDelay { get; set; }
         public bool RandomiseEventHandlerTimes { get; set; }
         
     }

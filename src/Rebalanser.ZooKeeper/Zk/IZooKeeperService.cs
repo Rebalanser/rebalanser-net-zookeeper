@@ -9,6 +9,7 @@ namespace Rebalanser.ZooKeeper.Zk
 {
     public interface IZooKeeperService
     {
+        void SessionExpired();
         Watcher.Event.KeeperState GetKeeperState();
         Task<bool> StartSessionAsync(TimeSpan sessionTimeout, TimeSpan connectTimeout, CancellationToken token);
         Task CloseSessionAsync();
